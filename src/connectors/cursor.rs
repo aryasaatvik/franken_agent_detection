@@ -29,8 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
-use frankensqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 use serde_json::Value;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
@@ -344,15 +343,16 @@ impl CursorConnector {
 
         let prefix_len = prefix.len();
 
-        if let Ok(rows) = conn.query_map_collect(
-            "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?",
-            params![prefix.as_str(), limit.as_str()],
-            |row| {
-                let key: String = row.get_typed(0)?;
-                let value: String = row.get_typed(1)?;
-                Ok((key, value))
-            },
-        ) {
+        let rows = conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?")
+            .and_then(|mut stmt| {
+                stmt.query_map(params![prefix.as_str(), limit.as_str()], |row| {
+                    let key: String = row.get(0)?;
+                    let value: String = row.get(1)?;
+                    Ok((key, value))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            });
+        if let Ok(rows) = rows {
             for (key, value) in rows {
                 // Key format: bubbleId:{composerId}:{bubbleId}
                 // Extract just the bubbleId part
@@ -433,14 +433,11 @@ impl CursorConnector {
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open Cursor db: {}", db_path.display()))?;
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("failed to open Cursor db: {}", db_path.display()))?;
 
         // Set busy timeout to 5 seconds to avoid locking errors when Cursor is running
-        conn.execute("PRAGMA busy_timeout = 5000;")
+        conn.busy_timeout(std::time::Duration::from_secs(5))
             .with_context(|| "failed to set busy_timeout")?;
 
         let mut convs = Vec::new();
@@ -449,18 +446,22 @@ impl CursorConnector {
         // Try cursorDiskKV table for composerData entries
         let composer_prefix = "composerData:";
         let composer_limit = Self::prefix_upper_bound(composer_prefix);
-        if let Ok(rows) = conn.query_map_collect(
+        let composer_rows = conn
             // Filter out NULL-value rows: Cursor inserts internal markers with no
-            // chat payload, and `row.get_typed(1)?` on NULL aborts the whole
-            // query_map_collect — silently turning every row into zero conversations.
-            "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ? AND value IS NOT NULL",
-            params![composer_prefix, composer_limit.as_str()],
-            |row| {
-                let key: String = row.get_typed(0)?;
-                let value: String = row.get_typed(1)?;
-                Ok((key, value))
-            },
-        ) {
+            // chat payload, and `row.get(1)?` on NULL aborts the whole row mapper —
+            // silently turning every row into zero conversations.
+            .prepare(
+                "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ? AND value IS NOT NULL",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(params![composer_prefix, composer_limit.as_str()], |row| {
+                    let key: String = row.get(0)?;
+                    let value: String = row.get(1)?;
+                    Ok((key, value))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            });
+        if let Ok(rows) = composer_rows {
             for (key, value) in rows {
                 if let Some(conv) = Self::parse_composer_data(
                     &key,
@@ -476,15 +477,19 @@ impl CursorConnector {
         }
 
         // Also try ItemTable for legacy aichat data
-        if let Ok(rows) = conn.query_map_collect(
-            "SELECT key, value FROM ItemTable WHERE (key LIKE '%aichat%chatdata%' OR key LIKE '%composer%') AND value IS NOT NULL",
-            params![],
-            |row| {
-                let key: String = row.get_typed(0)?;
-                let value: String = row.get_typed(1)?;
-                Ok((key, value))
-            },
-        ) {
+        let aichat_rows = conn
+            .prepare(
+                "SELECT key, value FROM ItemTable WHERE (key LIKE '%aichat%chatdata%' OR key LIKE '%composer%') AND value IS NOT NULL",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| {
+                    let key: String = row.get(0)?;
+                    let value: String = row.get(1)?;
+                    Ok((key, value))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            });
+        if let Ok(rows) = aichat_rows {
             for (key, value) in rows {
                 if let Some(conv) =
                     Self::parse_aichat_data(&key, &value, db_path, since_ts, &mut seen_ids)
@@ -909,8 +914,7 @@ impl Connector for CursorConnector {
 mod tests {
     use super::*;
     use crate::connectors::scan::ScanRoot;
-    use frankensqlite::compat::ConnectionExt;
-    use frankensqlite::params;
+    use rusqlite::params;
     use serde_json::json;
     use std::collections::HashSet;
     use std::fs;
@@ -918,11 +922,17 @@ mod tests {
 
     /// Create a test SQLite database with the cursorDiskKV table
     fn create_test_db(path: &Path) -> Connection {
-        let conn = Connection::open(path.to_string_lossy().as_ref()).unwrap();
-        conn.execute("CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
-            .unwrap();
-        conn.execute("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)")
-            .unwrap();
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
         conn
     }
 
@@ -1531,7 +1541,7 @@ mod tests {
 
         let conn = create_test_db(&db_path);
         let value = json!({ "text": "Database test" }).to_string();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
             params!["composerData:db-test-123", value.as_str()],
         )
@@ -1555,7 +1565,7 @@ mod tests {
             }]
         })
         .to_string();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
             params![
                 "workbench.panel.aichat.view.aichat.chatdata",
@@ -1590,7 +1600,7 @@ mod tests {
     }
 
     // Cursor inserts internal marker rows into `cursorDiskKV` with NULL `value`
-    // (e.g. composer metadata stubs). Without filtering, `row.get_typed::<String>(1)?`
+    // (e.g. composer metadata stubs). Without filtering, `row.get::<_, String>(1)?`
     // on NULL aborts the row mapper, the `if let Ok(rows) = ...` swallows the error,
     // and the whole connector silently returns zero conversations. Regression test:
     // a single NULL row must not mask the valid rows beside it. (PR #8)
@@ -1602,13 +1612,13 @@ mod tests {
         let conn = create_test_db(&db_path);
         // One valid composer entry.
         let value = json!({ "text": "Valid conversation" }).to_string();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
             params!["composerData:valid-row", value.as_str()],
         )
         .unwrap();
         // One internal-marker entry with NULL value sitting in the same prefix range.
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, NULL)",
             params!["composerData:null-marker"],
         )
@@ -1634,7 +1644,7 @@ mod tests {
             "tabs": [{ "bubbles": [{"text": "Valid aichat", "type": "user"}] }]
         })
         .to_string();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
             params![
                 "workbench.panel.aichat.view.aichat.chatdata",
@@ -1642,7 +1652,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO ItemTable (key, value) VALUES (?, NULL)",
             params!["workbench.panel.aichat.view.composer.null-marker"],
         )
@@ -1701,7 +1711,7 @@ mod tests {
         let db_path = global_dir.join("state.vscdb");
         let conn = create_test_db(&db_path);
         let value = json!({ "text": "Scan test" }).to_string();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
             params!["composerData:scan-123", value.as_str()],
         )
@@ -1745,7 +1755,7 @@ mod tests {
         let db_path = global_dir.join("state.vscdb");
         let conn = create_test_db(&db_path);
         let value = json!({ "text": "Explicit root" }).to_string();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
             params!["composerData:explicit-123", value.as_str()],
         )
@@ -1777,7 +1787,7 @@ mod tests {
         let db_path = global_dir.join("state.vscdb");
         let conn = create_test_db(&db_path);
         let value = json!({ "text": "Path test" }).to_string();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
             params!["composerData:path-123", value.as_str()],
         )
@@ -2105,9 +2115,12 @@ mod tests {
         let db_path = dir.path().join("no_tables.vscdb");
 
         // Create a valid SQLite DB but without the expected tables
-        let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
-        conn.execute("CREATE TABLE unrelated_table (id INTEGER PRIMARY KEY, data TEXT)")
-            .unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE unrelated_table (id INTEGER PRIMARY KEY, data TEXT)",
+            [],
+        )
+        .unwrap();
         drop(conn);
 
         let result = CursorConnector::extract_from_db(&db_path, None);
@@ -2130,7 +2143,7 @@ mod tests {
             ]
         })
         .to_string();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
             params!["composerData:v040-missing", value.as_str()],
         )
@@ -2191,7 +2204,7 @@ mod tests {
         let conn = create_test_db(&db_path);
 
         // Insert invalid JSON
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
             params!["composerData:invalid-1", "not valid json {{{"],
         )
@@ -2199,14 +2212,14 @@ mod tests {
 
         // Insert valid entry
         let valid_value = json!({ "text": "Valid entry" }).to_string();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
             params!["composerData:valid-1", valid_value.as_str()],
         )
         .unwrap();
 
         // Insert empty JSON
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
             params!["composerData:empty-1", "{}"],
         )
@@ -2214,7 +2227,7 @@ mod tests {
 
         // Insert another valid entry
         let valid_value2 = json!({ "text": "Another valid" }).to_string();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
             params!["composerData:valid-2", valid_value2.as_str()],
         )
