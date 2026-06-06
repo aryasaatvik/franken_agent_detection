@@ -23,8 +23,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
-use frankensqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 use super::utils::env_path_nonempty;
@@ -129,40 +128,41 @@ impl HermesConnector {
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open Hermes db: {}", db_path.display()))?;
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("failed to open Hermes db: {}", db_path.display()))?;
 
-        conn.execute("PRAGMA busy_timeout = 5000;")
+        conn.busy_timeout(std::time::Duration::from_secs(5))
             .with_context(|| "failed to set busy_timeout")?;
 
-        let sessions: Vec<HermesSession> = conn
-            .query_map_collect(
-                "SELECT id, source, model, title, parent_session_id, \
-                        started_at, ended_at, end_reason, \
-                        message_count, tool_call_count, input_tokens, output_tokens \
-                 FROM sessions",
-                params![],
-                |row| {
-                    Ok(HermesSession {
-                        id: row.get_typed(0)?,
-                        source: row.get_typed(1)?,
-                        model: row.get_typed(2)?,
-                        title: row.get_typed(3)?,
-                        parent_session_id: row.get_typed(4)?,
-                        started_at: row.get_typed(5)?,
-                        ended_at: row.get_typed(6)?,
-                        end_reason: row.get_typed(7)?,
-                        message_count: row.get_typed(8)?,
-                        tool_call_count: row.get_typed(9)?,
-                        input_tokens: row.get_typed(10)?,
-                        output_tokens: row.get_typed(11)?,
-                    })
-                },
-            )
-            .with_context(|| "failed to query Hermes sessions")?;
+        let sessions: Vec<HermesSession> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, source, model, title, parent_session_id, \
+                            started_at, ended_at, end_reason, \
+                            message_count, tool_call_count, input_tokens, output_tokens \
+                     FROM sessions",
+                )
+                .with_context(|| "failed to prepare Hermes sessions query")?;
+            stmt.query_map([], |row| {
+                Ok(HermesSession {
+                    id: row.get(0)?,
+                    source: row.get(1)?,
+                    model: row.get(2)?,
+                    title: row.get(3)?,
+                    parent_session_id: row.get(4)?,
+                    started_at: row.get(5)?,
+                    ended_at: row.get(6)?,
+                    end_reason: row.get(7)?,
+                    message_count: row.get(8)?,
+                    tool_call_count: row.get(9)?,
+                    input_tokens: row.get(10)?,
+                    output_tokens: row.get(11)?,
+                })
+            })
+            .with_context(|| "failed to query Hermes sessions")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .with_context(|| "failed to read Hermes session rows")?
+        };
 
         let mut convs = Vec::new();
         let mut seen_ids = HashSet::new();
@@ -232,22 +232,23 @@ impl HermesConnector {
 
     /// Load and normalize messages for a session.
     fn load_messages(conn: &Connection, session_id: &str) -> Result<Vec<NormalizedMessage>> {
-        let rows: Vec<HermesMessage> = conn.query_map_collect(
+        let mut stmt = conn.prepare(
             "SELECT role, content, tool_calls, tool_name, tool_call_id, reasoning, timestamp \
              FROM messages WHERE session_id = ? ORDER BY timestamp ASC",
-            params![session_id],
-            |row| {
-                Ok(HermesMessage {
-                    role: row.get_typed(0)?,
-                    content: row.get_typed(1)?,
-                    tool_calls: row.get_typed(2)?,
-                    tool_name: row.get_typed(3)?,
-                    tool_call_id: row.get_typed(4)?,
-                    reasoning: row.get_typed(5)?,
-                    timestamp: row.get_typed(6)?,
-                })
-            },
         )?;
+        let rows: Vec<HermesMessage> = stmt
+            .query_map(params![session_id], |row| {
+                Ok(HermesMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                    tool_calls: row.get(2)?,
+                    tool_name: row.get(3)?,
+                    tool_call_id: row.get(4)?,
+                    reasoning: row.get(5)?,
+                    timestamp: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut messages = Vec::new();
 

@@ -32,8 +32,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
-use frankensqlite::{Connection, Row, SqliteValue, params};
+use rusqlite::types::Value as SqliteValue;
+use rusqlite::{Connection, OpenFlags, Row};
 use serde::Deserialize;
 use walkdir::WalkDir;
 
@@ -439,34 +439,35 @@ impl OpenCodeConnector {
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open OpenCode db: {}", db_path.display()))?;
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("failed to open OpenCode db: {}", db_path.display()))?;
 
-        conn.execute("PRAGMA busy_timeout = 5000;")
+        conn.busy_timeout(std::time::Duration::from_secs(5))
             .with_context(|| "failed to set busy_timeout")?;
 
         // Query all sessions. Read timestamps as raw SQLite values — Drizzle ORM may
         // store them as ISO text (YYYY-MM-DD HH:MM:SS) or epoch integers depending on config.
         // We normalize in Rust rather than using strftime() which breaks on integer columns.
-        let sessions: Vec<SqliteSession> = conn
-            .query_map_collect(
-                "SELECT id, title, directory, project_id, time_created, time_updated FROM session",
-                params![],
-                |row| {
-                    Ok(SqliteSession {
-                        id: row.get_typed(0)?,
-                        title: row.get_typed(1)?,
-                        directory: row.get_typed(2)?,
-                        project_id: row.get_typed(3)?,
-                        time_created_raw: optional_sqlite_value(row, 4),
-                        time_updated_raw: optional_sqlite_value(row, 5),
-                    })
-                },
-            )
-            .with_context(|| "failed to query OpenCode sessions")?;
+        let sessions: Vec<SqliteSession> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, title, directory, project_id, time_created, time_updated FROM session",
+                )
+                .with_context(|| "failed to prepare OpenCode sessions query")?;
+            stmt.query_map([], |row| {
+                Ok(SqliteSession {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    directory: row.get(2)?,
+                    project_id: row.get(3)?,
+                    time_created_raw: optional_sqlite_value(row, 4),
+                    time_updated_raw: optional_sqlite_value(row, 5),
+                })
+            })
+            .with_context(|| "failed to query OpenCode sessions")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .with_context(|| "failed to read OpenCode session rows")?
+        };
 
         let mut messages_by_session = Self::load_sqlite_messages_by_session(&conn)?;
         let mut convs = Vec::new();
@@ -538,20 +539,21 @@ impl OpenCodeConnector {
         conn: &Connection,
     ) -> Result<HashMap<String, Vec<NormalizedMessage>>> {
         let mut parts_by_message = Self::load_sqlite_parts_by_message(conn)?;
-        let rows: Vec<SqliteMessageRow> = conn.query_map_collect(
+        let mut stmt = conn.prepare(
             "SELECT session_id, id, data, time_created
              FROM message
              ORDER BY session_id ASC, time_created ASC, id ASC",
-            params![],
-            |row| {
+        )?;
+        let rows: Vec<SqliteMessageRow> = stmt
+            .query_map([], |row| {
                 Ok(SqliteMessageRow {
-                    session_id: row.get_typed(0)?,
-                    id: row.get_typed(1)?,
-                    data_json: row.get_typed(2)?,
+                    session_id: row.get(0)?,
+                    id: row.get(1)?,
+                    data_json: row.get(2)?,
                     time_created_raw: optional_sqlite_value(row, 3),
                 })
-            },
-        )?;
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut pending_by_session: HashMap<String, Vec<PendingSqliteMessage>> = HashMap::new();
 
@@ -635,13 +637,14 @@ impl OpenCodeConnector {
     }
 
     fn load_sqlite_parts_by_message(conn: &Connection) -> Result<HashMap<String, Vec<PartInfo>>> {
-        let rows: Vec<(String, String)> = conn.query_map_collect(
+        let mut stmt = conn.prepare(
             "SELECT message_id, data
              FROM part
              ORDER BY message_id ASC, time_created ASC, id ASC",
-            params![],
-            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
         )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut parts_by_message: HashMap<String, Vec<PartInfo>> = HashMap::new();
         for (message_id, row) in rows {
@@ -1038,13 +1041,10 @@ fn normalize_opencode_timestamp(ts: Option<i64>) -> Option<i64> {
 }
 
 fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
-    row.get(index).and_then(|value| {
-        if matches!(value, SqliteValue::Null) {
-            None
-        } else {
-            Some(value.clone())
-        }
-    })
+    match row.get::<_, SqliteValue>(index) {
+        Ok(SqliteValue::Null) | Err(_) => None,
+        Ok(value) => Some(value),
+    }
 }
 
 /// Normalize a raw SQLite value to epoch milliseconds.
@@ -1057,7 +1057,7 @@ fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
 fn normalize_sqlite_ts_value(val: &SqliteValue) -> Option<i64> {
     match val {
         SqliteValue::Integer(i) => normalize_opencode_timestamp(Some(*i)),
-        SqliteValue::Float(f) => normalize_opencode_timestamp(Some(*f as i64)),
+        SqliteValue::Real(f) => normalize_opencode_timestamp(Some(*f as i64)),
         SqliteValue::Text(s) => {
             // Try common SQLite/Drizzle datetime formats (space separator)
             if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
@@ -1343,13 +1343,14 @@ fn assemble_content_from_parts(parts: &[PartInfo]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
     use serde_json::json;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
 
     fn open_test_connection(path: &Path) -> Connection {
-        Connection::open(path.to_string_lossy().as_ref()).unwrap()
+        Connection::open(path).unwrap()
     }
 
     // =====================================================
@@ -2942,13 +2943,13 @@ mod tests {
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
             params!["sess-1", "proj-1", "Test Session", "/home/user/project"],
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params![
                 "msg-1",
@@ -2958,7 +2959,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "part-1",
@@ -2969,7 +2970,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params![
                 "msg-2",
@@ -2979,7 +2980,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "part-2",
@@ -3019,7 +3020,7 @@ mod tests {
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, title) VALUES (?1, ?2)",
             params!["sess-empty", "Empty Session"],
         )
@@ -3038,20 +3039,20 @@ mod tests {
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, title) VALUES (?1, ?2)",
             params!["sess-tools", "Tool Session"],
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params!["msg-t1", "sess-tools", r#"{"role":"assistant"}"#],
         )
         .unwrap();
 
         // Text part
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "p1",
@@ -3063,7 +3064,7 @@ mod tests {
         .unwrap();
 
         // Tool part with output
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "p2",
@@ -3091,17 +3092,17 @@ mod tests {
 
         // Two sessions with different IDs
         for (sid, title) in &[("sess-a", "Session A"), ("sess-b", "Session B")] {
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO session (id, title) VALUES (?1, ?2)",
                 params![*sid, *title],
             )
             .unwrap();
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
                 params![format!("msg-{sid}"), *sid, r#"{"role":"user"}"#],
             )
             .unwrap();
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     format!("p-{sid}"),
@@ -3126,7 +3127,7 @@ mod tests {
         let conn = open_test_connection(&db_path);
 
         for session_id in ["sess-a", "sess-b"] {
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO session (id, title) VALUES (?1, ?2)",
                 params![session_id, format!("Session {session_id}")],
             )
@@ -3138,7 +3139,7 @@ mod tests {
             ("msg-b-only", "sess-b", "user", 20_i64),
             ("msg-a-early", "sess-a", "user", 10_i64),
         ] {
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO message (id, session_id, data, time_created)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
@@ -3149,7 +3150,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO part (id, message_id, session_id, data, time_created)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
@@ -3224,18 +3225,18 @@ mod tests {
         .unwrap();
 
         // Insert session with epoch second timestamps
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, project_id, title, time_created, time_updated) VALUES (?1, ?2, ?3, ?4, ?5)",
             params!["sess-int", "proj-1", "Integer TS Session", 1700000000_i64, 1700000100_i64],
         ).unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data, time_created) VALUES (?1, ?2, ?3, ?4)",
             params!["msg-int", "sess-int", r#"{"role":"user"}"#, 1700000050_i64],
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "part-int",
@@ -3262,17 +3263,17 @@ mod tests {
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, project_id, title) VALUES (?1, ?2, ?3)",
             params!["sess-meta", "proj-meta", "Meta Session"],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params!["msg-meta", "sess-meta", r#"{"role":"user"}"#],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "p-meta",
@@ -3378,7 +3379,7 @@ mod tests {
 
     #[test]
     fn normalize_sqlite_ts_value_real() {
-        let val = SqliteValue::Float(1_700_000_000.5);
+        let val = SqliteValue::Real(1_700_000_000.5);
         assert_eq!(normalize_sqlite_ts_value(&val), Some(1_700_000_000_000));
     }
 
@@ -3451,7 +3452,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "sess-parent",
@@ -3461,7 +3462,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params![
                 "msg-parent",
@@ -3470,7 +3471,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "part-parent",
@@ -3500,7 +3501,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "sess-roots",
@@ -3510,7 +3511,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params![
                 "msg-roots",
@@ -3519,7 +3520,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "part-roots",
@@ -3556,7 +3557,7 @@ mod tests {
 
         let db_path = create_test_sqlite_db(&opencode_dir);
         let conn = open_test_connection(&db_path);
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "sess-config",
@@ -3566,7 +3567,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params![
                 "msg-config",
@@ -3575,7 +3576,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "part-config",
@@ -3607,7 +3608,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "sess-direct",
@@ -3617,7 +3618,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params![
                 "msg-direct",
@@ -3626,7 +3627,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "part-direct",

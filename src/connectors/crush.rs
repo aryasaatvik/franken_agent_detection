@@ -11,13 +11,14 @@
 //! The `parts` column contains a JSON array of objects with `type` and `text` fields;
 //! text content is extracted from entries where `type == "text"`.
 //!
-//! **NOTE:** This connector uses `frankensqlite`. See AGENTS.md RULE 2.
+//! **NOTE:** This connector uses `rusqlite`. See AGENTS.md RULE 2.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ConnectionExt, OpenFlags, ParamValue, RowExt, open_with_flags};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
@@ -66,35 +67,35 @@ impl CrushConnector {
         dbs
     }
 
-    /// Extract sessions from a Crush `SQLite` database using frankensqlite.
+    /// Extract sessions from a Crush `SQLite` database using rusqlite.
     fn extract_from_sqlite(
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open Crush db: {}", db_path.display()))?;
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("failed to open Crush db: {}", db_path.display()))?;
 
-        conn.execute("PRAGMA busy_timeout = 5000;")
+        conn.busy_timeout(std::time::Duration::from_secs(5))
             .with_context(|| "failed to set busy_timeout")?;
 
         let (query, params) = Self::build_query(since_ts);
-        let rows: Vec<CrushRow> = conn.query_map_collect(&query, &params, |row| {
-            Ok(CrushRow {
-                session_id: row.get_typed(0)?,
-                title: row.get_typed(1)?,
-                prompt_tokens: row.get_typed(2)?,
-                completion_tokens: row.get_typed(3)?,
-                cost: row.get_typed(4)?,
-                role: row.get_typed(5)?,
-                parts_json: row.get_typed(6)?,
-                created_at: row.get_typed(7)?,
-                model: row.get_typed(8)?,
-                provider: row.get_typed(9)?,
-            })
-        })?;
+        let mut stmt = conn.prepare(&query)?;
+        let rows: Vec<CrushRow> = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok(CrushRow {
+                    session_id: row.get(0)?,
+                    title: row.get(1)?,
+                    prompt_tokens: row.get(2)?,
+                    completion_tokens: row.get(3)?,
+                    cost: row.get(4)?,
+                    role: row.get(5)?,
+                    parts_json: row.get(6)?,
+                    created_at: row.get(7)?,
+                    model: row.get(8)?,
+                    provider: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         Ok(group_rows_into_conversations(&rows, db_path))
     }
@@ -104,7 +105,7 @@ impl CrushConnector {
     /// When `since_ts` is set, uses a subquery to find sessions with ANY message
     /// at or after the cutoff, then returns ALL messages for those sessions.
     /// This ensures complete conversations are always returned.
-    fn build_query(since_ts: Option<i64>) -> (String, Vec<ParamValue>) {
+    fn build_query(since_ts: Option<i64>) -> (String, Vec<SqlValue>) {
         const BASE: &str = "SELECT s.id, s.title, s.prompt_tokens, s.completion_tokens, s.cost, \
                             m.role, m.parts, m.created_at, m.model, m.provider \
                             FROM sessions s JOIN messages m ON m.session_id = s.id";
@@ -118,7 +119,7 @@ impl CrushConnector {
                          (SELECT DISTINCT session_id FROM messages WHERE created_at >= ?1) \
                          ORDER BY s.id, m.created_at"
                     ),
-                    vec![ParamValue::from(since)],
+                    vec![SqlValue::Integer(since)],
                 )
             },
         )
@@ -389,8 +390,7 @@ fn flush_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensqlite::compat::ConnectionExt;
-    use frankensqlite::params;
+    use rusqlite::params;
 
     #[test]
     fn extract_text_from_parts_basic() {
@@ -428,7 +428,7 @@ mod tests {
     fn scan_discovers_consumed_sqlite_database() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("crush.db");
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
 
         conn.execute(
             "CREATE TABLE sessions (
@@ -438,6 +438,7 @@ mod tests {
                 completion_tokens INTEGER,
                 cost REAL
             )",
+            [],
         )
         .unwrap();
         conn.execute(
@@ -449,15 +450,16 @@ mod tests {
                 model TEXT,
                 provider TEXT
             )",
+            [],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO sessions (id, title, prompt_tokens, completion_tokens, cost)
              VALUES (?, ?, ?, ?, ?)",
             params!["sess-001", "Crush Test", 1_i64, 2_i64, 0.01_f64],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO messages (session_id, role, parts, created_at, model, provider)
              VALUES (?, ?, ?, ?, ?, ?)",
             params![

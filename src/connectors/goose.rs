@@ -22,8 +22,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
-use frankensqlite::{Connection, Row, SqliteValue, params};
+use rusqlite::types::Value as SqliteValue;
+use rusqlite::{Connection, OpenFlags, Row, params};
 use serde::Deserialize;
 use walkdir::WalkDir;
 
@@ -353,36 +353,37 @@ impl GooseConnector {
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open Goose db: {}", db_path.display()))?;
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("failed to open Goose db: {}", db_path.display()))?;
 
-        conn.execute("PRAGMA busy_timeout = 5000;")
+        conn.busy_timeout(std::time::Duration::from_secs(5))
             .with_context(|| "failed to set busy_timeout")?;
 
         // Query all sessions
-        let sessions: Vec<GooseSqliteSession> = conn
-            .query_map_collect(
-                "SELECT id, description, working_dir, created_at, updated_at, \
-                        provider_name, model_config_json, session_type \
-                 FROM sessions",
-                params![],
-                |row| {
-                    Ok(GooseSqliteSession {
-                        id: row.get_typed(0)?,
-                        description: row.get_typed(1)?,
-                        working_dir: row.get_typed(2)?,
-                        created_at: optional_sqlite_value(row, 3),
-                        updated_at: optional_sqlite_value(row, 4),
-                        provider_name: row.get_typed(5)?,
-                        model_config_json: row.get_typed(6)?,
-                        session_type: row.get_typed(7)?,
-                    })
-                },
-            )
-            .with_context(|| "failed to query Goose sessions")?;
+        let sessions: Vec<GooseSqliteSession> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, description, working_dir, created_at, updated_at, \
+                            provider_name, model_config_json, session_type \
+                     FROM sessions",
+                )
+                .with_context(|| "failed to prepare Goose sessions query")?;
+            stmt.query_map([], |row| {
+                Ok(GooseSqliteSession {
+                    id: row.get(0)?,
+                    description: row.get(1)?,
+                    working_dir: row.get(2)?,
+                    created_at: optional_sqlite_value(row, 3),
+                    updated_at: optional_sqlite_value(row, 4),
+                    provider_name: row.get(5)?,
+                    model_config_json: row.get(6)?,
+                    session_type: row.get(7)?,
+                })
+            })
+            .with_context(|| "failed to query Goose sessions")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .with_context(|| "failed to read Goose session rows")?
+        };
 
         let mut convs = Vec::new();
         let mut seen_ids = HashSet::new();
@@ -465,21 +466,22 @@ impl GooseConnector {
 
     /// Load messages for a session from SQLite.
     fn load_messages_sqlite(conn: &Connection, session_id: &str) -> Result<Vec<NormalizedMessage>> {
-        let rows: Vec<GooseSqliteMessage> = conn.query_map_collect(
+        let mut stmt = conn.prepare(
             "SELECT message_id, role, content_json, created_timestamp, tokens, metadata_json \
              FROM messages WHERE session_id = ? ORDER BY created_timestamp ASC",
-            params![session_id],
-            |row| {
-                Ok(GooseSqliteMessage {
-                    message_id: row.get_typed(0)?,
-                    role: row.get_typed(1)?,
-                    content_json: row.get_typed(2)?,
-                    created_timestamp: optional_sqlite_value(row, 3),
-                    tokens: row.get_typed(4)?,
-                    metadata_json: row.get_typed(5)?,
-                })
-            },
         )?;
+        let rows: Vec<GooseSqliteMessage> = stmt
+            .query_map(params![session_id], |row| {
+                Ok(GooseSqliteMessage {
+                    message_id: row.get(0)?,
+                    role: row.get(1)?,
+                    content_json: row.get(2)?,
+                    created_timestamp: optional_sqlite_value(row, 3),
+                    tokens: row.get(4)?,
+                    metadata_json: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut pending: Vec<(Option<i64>, String, NormalizedMessage)> = Vec::new();
 
@@ -747,13 +749,10 @@ fn looks_like_goose_sessions(path: &Path) -> bool {
 }
 
 fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
-    row.get(index).and_then(|value| {
-        if matches!(value, SqliteValue::Null) {
-            None
-        } else {
-            Some(value.clone())
-        }
-    })
+    match row.get::<_, SqliteValue>(index) {
+        Ok(SqliteValue::Null) | Err(_) => None,
+        Ok(value) => Some(value),
+    }
 }
 
 /// Normalize a raw SQLite value to epoch milliseconds.
@@ -765,7 +764,7 @@ fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
 fn normalize_goose_ts_value(val: &SqliteValue) -> Option<i64> {
     match val {
         SqliteValue::Integer(i) => normalize_goose_timestamp(Some(*i)),
-        SqliteValue::Float(f) => {
+        SqliteValue::Real(f) => {
             if f.is_nan() || f.is_infinite() {
                 return None;
             }
@@ -1047,7 +1046,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn open_test_connection(path: &Path) -> Connection {
-        Connection::open(path.to_string_lossy().as_ref()).unwrap()
+        Connection::open(path).unwrap()
     }
 
     // =====================================================
@@ -1146,7 +1145,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO sessions (id, description, working_dir, created_at, updated_at, provider_name) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -1163,7 +1162,7 @@ mod tests {
         let content_json = json!([
             {"type": "text", "text": "Hello from share!"}
         ]);
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO messages (session_id, role, content_json, created_timestamp, tokens, metadata_json, message_id) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -1340,7 +1339,7 @@ mod tests {
 
     #[test]
     fn normalize_sqlite_ts_real() {
-        let val = SqliteValue::Float(1_700_000_000.5);
+        let val = SqliteValue::Real(1_700_000_000.5);
         let result = normalize_goose_ts_value(&val);
         assert!(result.is_some());
         assert_eq!(result.unwrap(), 1_700_000_000_500);
@@ -1448,7 +1447,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO sessions (id, description, working_dir, created_at, updated_at, provider_name) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -1465,7 +1464,7 @@ mod tests {
         let content_json = json!([
             {"type": "text", "text": "Hello from Goose!"}
         ]);
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO messages (session_id, role, content_json, created_timestamp, tokens, metadata_json, message_id) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -1529,7 +1528,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO sessions (id, description, created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4)",
             params!["sess1", "Tools test", 1_700_000_000, 1_700_000_100],
@@ -1549,7 +1548,7 @@ mod tests {
                 }
             }
         ]);
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO messages (session_id, role, content_json, created_timestamp, message_id) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -1602,12 +1601,12 @@ mod tests {
         .unwrap();
 
         // Old session
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO sessions (id, description, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
             params!["old", "Old session", 1_600_000_000, 1_600_000_100],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO messages (session_id, role, content_json, created_timestamp, message_id) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -1621,12 +1620,12 @@ mod tests {
         .unwrap();
 
         // New session
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO sessions (id, description, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
             params!["new", "New session", 1_700_000_000, 1_700_000_100],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO messages (session_id, role, content_json, created_timestamp, message_id) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -1678,7 +1677,7 @@ mod tests {
         .unwrap();
 
         // Session with no messages
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO sessions (id, description, created_at) VALUES (?1, ?2, ?3)",
             params!["empty", "Empty session", 1_700_000_000],
         )
