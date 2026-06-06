@@ -367,7 +367,7 @@ impl GooseConnector {
                             provider_name, model_config_json, session_type \
                      FROM sessions",
                 )
-                .with_context(|| "failed to query Goose sessions")?;
+                .with_context(|| "failed to prepare Goose sessions query")?;
             stmt.query_map([], |row| {
                 Ok(GooseSqliteSession {
                     id: row.get(0)?,
@@ -382,7 +382,7 @@ impl GooseConnector {
             })
             .with_context(|| "failed to query Goose sessions")?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .with_context(|| "failed to query Goose sessions")?
+            .with_context(|| "failed to read Goose session rows")?
         };
 
         let mut convs = Vec::new();

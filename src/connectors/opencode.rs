@@ -453,7 +453,7 @@ impl OpenCodeConnector {
                 .prepare(
                     "SELECT id, title, directory, project_id, time_created, time_updated FROM session",
                 )
-                .with_context(|| "failed to query OpenCode sessions")?;
+                .with_context(|| "failed to prepare OpenCode sessions query")?;
             stmt.query_map([], |row| {
                 Ok(SqliteSession {
                     id: row.get(0)?,
@@ -466,7 +466,7 @@ impl OpenCodeConnector {
             })
             .with_context(|| "failed to query OpenCode sessions")?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .with_context(|| "failed to query OpenCode sessions")?
+            .with_context(|| "failed to read OpenCode session rows")?
         };
 
         let mut messages_by_session = Self::load_sqlite_messages_by_session(&conn)?;

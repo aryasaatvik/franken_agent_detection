@@ -142,7 +142,7 @@ impl HermesConnector {
                             message_count, tool_call_count, input_tokens, output_tokens \
                      FROM sessions",
                 )
-                .with_context(|| "failed to query Hermes sessions")?;
+                .with_context(|| "failed to prepare Hermes sessions query")?;
             stmt.query_map([], |row| {
                 Ok(HermesSession {
                     id: row.get(0)?,
@@ -161,7 +161,7 @@ impl HermesConnector {
             })
             .with_context(|| "failed to query Hermes sessions")?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .with_context(|| "failed to query Hermes sessions")?
+            .with_context(|| "failed to read Hermes session rows")?
         };
 
         let mut convs = Vec::new();
