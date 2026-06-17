@@ -25,9 +25,34 @@ impl DetectionResult {
     }
 }
 
+/// How a conversation relates to its lineage parent, when the relationship
+/// is known at ingest time. `None` means the relation could not be determined.
+#[cfg(feature = "connectors")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineageRelation {
+    /// No parent — a root thread.
+    Root,
+    /// Continuation of a prior thread (CC cross-file resume, Codex resume/append).
+    Resume,
+    /// Branched copy that diverges from a parent (Codex fork, CC rewind branch).
+    Fork,
+    /// Spawned as a subagent/child of a parent thread.
+    Subagent,
+}
+
+/// `serde` predicate: skip serializing a `bool` field when it is `false`.
+/// `serde`'s `skip_serializing_if` requires a `&T` predicate, so the `&bool`
+/// is mandated by the API rather than a missed copy.
+#[cfg(feature = "connectors")]
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
 /// Normalized conversation emitted by connectors.
 #[cfg(feature = "connectors")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NormalizedConversation {
     pub agent_slug: String,
     pub external_id: Option<String>,
@@ -38,10 +63,24 @@ pub struct NormalizedConversation {
     pub ended_at: Option<i64>,
     pub metadata: serde_json::Value,
     pub messages: Vec<NormalizedMessage>,
+    /// Stable per-thread external id (CC `sessionId`, Codex `session_meta.id`).
+    /// Distinct from `external_id`, which is the per-file/source key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_external_id: Option<String>,
+    /// External id of the thread this one was forked or resumed from
+    /// (Codex `forked_from_id` / subagent `parent_thread_id`, CC resume parent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_external_id: Option<String>,
+    /// How this conversation relates to its parent, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_relation: Option<LineageRelation>,
+    /// Git branch the session was recorded on, when the agent captured it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
 }
 
 #[cfg(feature = "connectors")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NormalizedMessage {
     pub idx: i64,
     pub role: String,
@@ -53,6 +92,18 @@ pub struct NormalizedMessage {
     /// Structured tool/skill invocations extracted from this message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invocations: Vec<NormalizedInvocation>,
+    /// Stable per-message uid (CC `uuid`); the node key for lineage trees.
+    /// Survives `compact_message_extra` because it is a typed field, not
+    /// part of the raw `extra` blob that compaction strips on huge sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_uid: Option<String>,
+    /// Parent message uid (CC `parentUuid`, or `logicalParentUuid` across a
+    /// compaction boundary); edges of the per-file lineage tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_msg_uid: Option<String>,
+    /// Whether this message belongs to a sidechain (CC `isSidechain`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_sidechain: bool,
 }
 
 /// A single tool or skill invocation within a message.

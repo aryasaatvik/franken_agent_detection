@@ -396,6 +396,7 @@ impl Connector for ClineConnector {
                             invocations: content_val
                                 .map_or_else(Vec::new, extract_invocations_from_content_blocks),
                             snippets: Vec::new(),
+                            ..Default::default()
                         });
                     }
                 }
@@ -454,6 +455,7 @@ impl Connector for ClineConnector {
                     ended_at: messages.iter().filter_map(|m| m.created_at).max(),
                     metadata: serde_json::json!({"source": "cline"}),
                     messages,
+                    ..Default::default()
                 });
             }
         }

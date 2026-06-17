@@ -342,6 +342,7 @@ impl CopilotCliConnector {
                 extra: event,
                 invocations: Vec::new(),
                 snippets: Vec::new(),
+                ..Default::default()
             });
         }
 
@@ -389,6 +390,7 @@ impl CopilotCliConnector {
             ended_at,
             metadata,
             messages,
+            ..Default::default()
         }])
     }
 
@@ -451,6 +453,7 @@ impl CopilotCliConnector {
                 extra: event.clone(),
                 invocations: Vec::new(),
                 snippets: Vec::new(),
+                ..Default::default()
             });
         }
 
@@ -504,6 +507,7 @@ impl CopilotCliConnector {
             ended_at,
             metadata,
             messages,
+            ..Default::default()
         }]
     }
 

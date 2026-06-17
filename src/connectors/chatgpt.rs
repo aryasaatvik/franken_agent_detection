@@ -568,6 +568,7 @@ impl ChatGptConnector {
                     extra: msg.clone(),
                     invocations: Vec::new(),
                     snippets: Vec::new(),
+                    ..Default::default()
                 });
             }
         }
@@ -621,6 +622,7 @@ impl ChatGptConnector {
                     extra: item.clone(),
                     invocations: Vec::new(),
                     snippets: Vec::new(),
+                    ..Default::default()
                 });
             }
         }
@@ -643,6 +645,7 @@ impl ChatGptConnector {
                 "encrypted": is_encrypted,
             }),
             messages,
+            ..Default::default()
         }))
     }
 }

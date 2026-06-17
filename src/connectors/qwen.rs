@@ -291,6 +291,7 @@ fn parse_qwen_session(path: &Path) -> Result<Option<NormalizedConversation>> {
             extra: raw_msg.clone(),
             invocations: Vec::new(),
             snippets: Vec::new(),
+            ..Default::default()
         });
     }
 
@@ -330,6 +331,7 @@ fn parse_qwen_session(path: &Path) -> Result<Option<NormalizedConversation>> {
         ended_at,
         metadata,
         messages,
+        ..Default::default()
     }))
 }
 

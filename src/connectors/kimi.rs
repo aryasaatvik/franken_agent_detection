@@ -408,6 +408,7 @@ fn parse_kimi_session(path: &Path) -> Result<Option<NormalizedConversation>> {
                             extra: val.clone(),
                             invocations: Vec::new(),
                             snippets: Vec::new(),
+                            ..Default::default()
                         });
                     }
                 }
@@ -431,6 +432,7 @@ fn parse_kimi_session(path: &Path) -> Result<Option<NormalizedConversation>> {
                         extra: val,
                         invocations: Vec::new(),
                         snippets: Vec::new(),
+                        ..Default::default()
                     });
                 }
             }
@@ -467,6 +469,7 @@ fn parse_kimi_session(path: &Path) -> Result<Option<NormalizedConversation>> {
                     extra: val,
                     invocations,
                     snippets: Vec::new(),
+                    ..Default::default()
                 });
             }
             // Skip metadata, StepBegin, and other non-content types
@@ -506,6 +509,7 @@ fn parse_kimi_session(path: &Path) -> Result<Option<NormalizedConversation>> {
             "sessionId": session_id,
         }),
         messages,
+        ..Default::default()
     }))
 }
 

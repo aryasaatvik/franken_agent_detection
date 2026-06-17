@@ -293,6 +293,7 @@ impl Connector for VibeConnector {
                         extra: val,
                         invocations: Vec::new(),
                         snippets: Vec::new(),
+                        ..Default::default()
                     });
                 }
 
@@ -333,6 +334,7 @@ impl Connector for VibeConnector {
                     ended_at,
                     metadata,
                     messages,
+                    ..Default::default()
                 });
             }
         }

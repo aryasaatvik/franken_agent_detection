@@ -419,6 +419,10 @@ fn scan_codex_with_callback(
             let mut started_at = None;
             let mut ended_at = None;
             let mut session_cwd: Option<PathBuf> = None;
+            let mut session_thread_id: Option<String> = None;
+            let mut parent_thread_id: Option<String> = None;
+            let mut git_branch: Option<String> = None;
+            let mut lineage_relation: Option<crate::types::LineageRelation> = None;
 
             if ext == Some("jsonl") {
                 let f = std::fs::File::open(&file)
@@ -446,6 +450,35 @@ fn scan_codex_with_callback(
                                     .get("cwd")
                                     .and_then(|v| v.as_str())
                                     .map(PathBuf::from);
+                                if session_thread_id.is_none() {
+                                    session_thread_id = payload
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from);
+                                }
+                                if git_branch.is_none() {
+                                    git_branch = payload
+                                        .pointer("/git/branch")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from);
+                                }
+                                // A forked session records the thread id it
+                                // diverged from; a subagent records its spawner.
+                                if let Some(forked) = payload
+                                    .get("forked_from_id")
+                                    .or_else(|| val.get("forked_from_id"))
+                                    .and_then(|v| v.as_str())
+                                {
+                                    parent_thread_id = Some(forked.to_string());
+                                    lineage_relation = Some(crate::types::LineageRelation::Fork);
+                                } else if let Some(parent) = payload
+                                    .pointer("/source/subagent/thread_spawn/parent_thread_id")
+                                    .and_then(|v| v.as_str())
+                                {
+                                    parent_thread_id = Some(parent.to_string());
+                                    lineage_relation =
+                                        Some(crate::types::LineageRelation::Subagent);
+                                }
                             }
                             update_time_bounds(&mut started_at, &mut ended_at, created);
                         }
@@ -483,6 +516,7 @@ fn scan_codex_with_callback(
                                     },
                                     invocations,
                                     snippets: Vec::new(),
+                                    ..Default::default()
                                 });
                             }
                         }
@@ -515,6 +549,7 @@ fn scan_codex_with_callback(
                                                 },
                                                 invocations: Vec::new(),
                                                 snippets: Vec::new(),
+                                                ..Default::default()
                                             });
                                         }
                                     }
@@ -542,6 +577,7 @@ fn scan_codex_with_callback(
                                                 },
                                                 invocations: Vec::new(),
                                                 snippets: Vec::new(),
+                                                ..Default::default()
                                             });
                                         }
                                     }
@@ -584,6 +620,7 @@ fn scan_codex_with_callback(
                                                 arguments,
                                             }],
                                             snippets: Vec::new(),
+                                            ..Default::default()
                                         });
                                     }
                                     Some("token_count") => {
@@ -654,6 +691,7 @@ fn scan_codex_with_callback(
                                 .get("content")
                                 .map_or_else(Vec::new, extract_invocations_from_content_blocks),
                             snippets: Vec::new(),
+                            ..Default::default()
                         });
                     }
                 }
@@ -693,6 +731,10 @@ fn scan_codex_with_callback(
                 ended_at,
                 metadata: serde_json::json!({"source": if ext == Some("json") { "rollout_json" } else { "rollout" }}),
                 messages,
+                thread_external_id: session_thread_id,
+                parent_external_id: parent_thread_id,
+                lineage_relation,
+                git_branch,
             })?;
         }
     }

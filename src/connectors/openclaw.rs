@@ -515,6 +515,7 @@ impl Connector for OpenClawConnector {
                                 extra: val,
                                 invocations,
                                 snippets: Vec::new(),
+                                ..Default::default()
                             });
                         }
                         // Skip model_change, thinking_level_change, custom, etc.
@@ -563,6 +564,7 @@ impl Connector for OpenClawConnector {
                     ended_at,
                     metadata,
                     messages,
+                    ..Default::default()
                 });
                 agent_session_count += 1;
             }

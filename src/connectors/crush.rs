@@ -299,6 +299,7 @@ fn group_rows_into_conversations(rows: &[CrushRow], db_path: &Path) -> Vec<Norma
             }),
             invocations: Vec::new(),
             snippets: Vec::new(),
+            ..Default::default()
         });
 
         if current_session_id != Some(&row.session_id) {
@@ -384,6 +385,7 @@ fn flush_session(
             "source": "sqlite",
         }),
         messages: msgs,
+        ..Default::default()
     });
 }
 

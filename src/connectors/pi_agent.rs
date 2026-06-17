@@ -485,6 +485,7 @@ impl Connector for PiAgentConnector {
                                     extra: val.clone(),
                                     invocations,
                                     snippets: Vec::new(),
+                                    ..Default::default()
                                 });
                             }
                         }
@@ -547,6 +548,7 @@ impl Connector for PiAgentConnector {
                     ended_at,
                     metadata,
                     messages,
+                    ..Default::default()
                 });
             }
         }

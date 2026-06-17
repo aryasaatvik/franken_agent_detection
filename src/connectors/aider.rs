@@ -79,6 +79,7 @@ impl AiderConnector {
                         extra: json!({}),
                         invocations: Vec::new(),
                         snippets: Vec::new(),
+                        ..Default::default()
                     });
                     msg_idx += 1;
                     current_content.clear();
@@ -105,6 +106,7 @@ impl AiderConnector {
                             extra: json!({}),
                             invocations: Vec::new(),
                             snippets: Vec::new(),
+                            ..Default::default()
                         });
                         msg_idx += 1;
                         current_content.clear();
@@ -126,6 +128,7 @@ impl AiderConnector {
                 extra: json!({}),
                 invocations: Vec::new(),
                 snippets: Vec::new(),
+                ..Default::default()
             });
         }
 
@@ -154,6 +157,7 @@ impl AiderConnector {
             ended_at: Some(ts),
             metadata: json!({}),
             messages,
+            ..Default::default()
         })
     }
 

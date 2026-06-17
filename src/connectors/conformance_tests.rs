@@ -413,6 +413,7 @@ mod conformance {
                         extra: json!({}),
                         invocations: vec![],
                         snippets: vec![],
+                        ..Default::default()
                     },
                     NormalizedMessage {
                         idx: 1,
@@ -423,8 +424,10 @@ mod conformance {
                         extra: json!({}),
                         invocations: vec![],
                         snippets: vec![],
+                        ..Default::default()
                     },
                 ],
+                ..Default::default()
             };
 
             // Should serialize to valid JSON

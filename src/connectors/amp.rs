@@ -357,6 +357,7 @@ impl Connector for AmpConnector {
                             ended_at,
                             metadata: val.clone(),
                             messages,
+                            ..Default::default()
                         });
                         tracing::info!(
                             target: "connector::amp",
@@ -444,6 +445,7 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
                 inv
             },
             snippets: Vec::new(),
+            ..Default::default()
         });
     }
 

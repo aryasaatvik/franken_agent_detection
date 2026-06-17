@@ -446,6 +446,7 @@ fn scan_gemini_with_callback(
                     },
                     invocations: Vec::new(),
                     snippets: Vec::new(),
+                    ..Default::default()
                 });
             }
 
@@ -500,6 +501,7 @@ fn scan_gemini_with_callback(
                     "project_hash": project_hash
                 }),
                 messages,
+                ..Default::default()
             })?;
         }
     }
@@ -674,6 +676,7 @@ mod tests {
             extra: serde_json::Value::Null,
             snippets: vec![],
             invocations: vec![],
+            ..Default::default()
         }];
         let result = extract_workspace_from_content(&messages);
         assert_eq!(result, Some(PathBuf::from("/data/projects/myapp")));
@@ -690,6 +693,7 @@ mod tests {
             extra: serde_json::Value::Null,
             snippets: vec![],
             invocations: vec![],
+            ..Default::default()
         }];
         let result = extract_workspace_from_content(&messages);
         assert_eq!(result, Some(PathBuf::from("/home/user/project")));
@@ -706,6 +710,7 @@ mod tests {
             extra: serde_json::Value::Null,
             snippets: vec![],
             invocations: vec![],
+            ..Default::default()
         }];
         let result = extract_workspace_from_content(&messages);
         assert_eq!(result, Some(PathBuf::from("/data/projects/foo")));
@@ -722,6 +727,7 @@ mod tests {
             extra: serde_json::Value::Null,
             snippets: vec![],
             invocations: vec![],
+            ..Default::default()
         }];
         let result = extract_workspace_from_content(&messages);
         assert_eq!(result, None);
@@ -740,6 +746,7 @@ mod tests {
             extra: serde_json::Value::Null,
             snippets: vec![],
             invocations: vec![],
+            ..Default::default()
         }];
         // AGENTS.md pattern should be found first
         let result = extract_workspace_from_content(&messages);
