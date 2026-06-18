@@ -287,7 +287,21 @@ impl OpenCodeConnector {
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
         let mut out = Vec::new();
         Self::discover_sqlite_sources(ctx, &mut out);
-        Self::discover_legacy_storage_sources(ctx, &mut out);
+        // `opencode.db` is authoritative once it exists: opencode's v1.2
+        // migration imports the pre-v1.2 file storage
+        // (`storage/{session,message,part}`) into the database and then leaves
+        // those files untouched. When the DB is present the legacy tree is
+        // fully redundant — and on a migrated install it is hundreds of
+        // thousands of tiny per-part files. Enumerating them here makes the
+        // indexer capture each one into the raw mirror before the scan even
+        // starts, which stalls ingestion. Only fall back to discovering legacy
+        // sources on pre-v1.2 installs that never migrated (no DB present).
+        let has_sqlite_db = out
+            .iter()
+            .any(|source| source.role == DiscoveredSourceRole::SqliteDatabase);
+        if !has_sqlite_db {
+            Self::discover_legacy_storage_sources(ctx, &mut out);
+        }
         out
     }
 
@@ -871,6 +885,13 @@ impl Connector for OpenCodeConnector {
         // session present in both sources is emitted only once (first wins).
         let mut seen_ids: HashSet<String> = HashSet::new();
         let mut scanned_dbs: HashSet<PathBuf> = HashSet::new();
+        // Whether at least one SQLite database was read successfully. This — not
+        // `seen_ids` — gates the legacy fallback: an incremental scan can read
+        // the DB cleanly yet emit nothing (every session predates `since_ts`),
+        // which would leave `seen_ids` empty and wrongly re-trigger the legacy
+        // walk. A DB that opened OK is authoritative regardless of how many
+        // sessions matched; a DB that failed to open still falls back to legacy.
+        let mut db_scanned_ok = false;
 
         // --- Phase 1: Try SQLite database(s) (v1.2+) ---
         // Collect candidate database paths in priority order:
@@ -937,12 +958,30 @@ impl Connector for OpenCodeConnector {
             if let Some(err) = callback_error {
                 return Err(err);
             }
-            if let Err(e) = stream_result {
-                tracing::debug!("opencode sqlite: failed to read {}: {e}", db.display());
+            match stream_result {
+                Ok(()) => db_scanned_ok = true,
+                Err(e) => {
+                    tracing::debug!("opencode sqlite: failed to read {}: {e}", db.display());
+                }
             }
         }
 
         // --- Phase 2: Fall back to JSON file storage (pre-v1.2) ---
+        //
+        // The SQLite database is authoritative once it has been read: opencode's
+        // v1.2 migration imports the legacy file storage into the DB and stops
+        // writing the files, so a readable DB already contains every legacy
+        // session (the dedup set would drop them all anyway). Skipping the
+        // fallback avoids re-walking and re-parsing the migrated tree, which on a
+        // real install is 100k+ message + part files. Gate on `db_scanned_ok`,
+        // not on whether any session was emitted: an incremental scan can read
+        // the DB cleanly yet match zero sessions (all predate `since_ts`), and
+        // that must still skip the legacy walk. Only installs with no readable
+        // DB (pre-v1.2, or a corrupt DB) fall through to the file scan.
+        if db_scanned_ok {
+            return Ok(());
+        }
+
         let mut storage_roots: Vec<PathBuf> = Vec::new();
         if ctx.use_default_detection() {
             if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
@@ -4041,6 +4080,168 @@ mod tests {
         assert!(
             convs.is_empty(),
             "no readable message/part rows -> zero conversations (drift guard warns)"
+        );
+    }
+
+    /// Once `opencode.db` exists it is authoritative: opencode's v1.2 migration
+    /// imports the pre-v1.2 file storage into the DB and stops writing the
+    /// files. So when both are present in the same root, the connector must
+    /// ignore the legacy tree — both for raw-mirror source discovery (otherwise
+    /// it captures the migrated install's 100k+ per-part files one-by-one and
+    /// stalls the indexer) and for scanning (otherwise it re-reads them only to
+    /// dedup them away).
+    #[test]
+    fn db_present_supersedes_legacy_file_storage() {
+        let dir = TempDir::new().unwrap();
+
+        // (1) A populated SQLite DB at <dir>/opencode.db.
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute(
+            "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
+            params!["sess-db", "proj-db", "DB Session", "/home/user/db"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params![
+                "msg-db",
+                "sess-db",
+                r#"{"role":"user","time":{"created":1700000000000}}"#
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "part-db",
+                "msg-db",
+                "sess-db",
+                r#"{"type":"text","text":"From DB"}"#
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        // (2) Legacy file storage in the SAME root, holding a session that only
+        //     exists on disk (un-pruned pre-migration leftover).
+        write_session(
+            dir.path(),
+            "proj-legacy",
+            &json!({"id": "sess-legacy", "title": "Legacy", "projectID": "proj-legacy"}),
+        );
+        write_message(
+            dir.path(),
+            "sess-legacy",
+            &json!({"id": "msg-legacy", "role": "user", "sessionID": "sess-legacy", "time": {"created": 1700000000}}),
+        );
+        write_part(
+            dir.path(),
+            "msg-legacy",
+            &json!({"id": "p-legacy", "messageID": "msg-legacy", "type": "text", "text": "From legacy file"}),
+        );
+
+        let connector = OpenCodeConnector::new();
+        let ctx = ScanContext::local_default(dir.path().to_path_buf(), None);
+
+        // Raw-mirror source discovery: only the DB, never the legacy files.
+        let sources = connector.discover_source_files(&ctx).unwrap();
+        assert!(
+            sources
+                .iter()
+                .any(|s| s.role == DiscoveredSourceRole::SqliteDatabase),
+            "the SQLite database must still be discovered"
+        );
+        assert!(
+            !sources.iter().any(|s| matches!(
+                s.role,
+                DiscoveredSourceRole::PrimarySessionLog | DiscoveredSourceRole::MetadataSidecar
+            )),
+            "legacy file sources must not be discovered when opencode.db is present: {:?}",
+            sources.iter().map(|s| s.role).collect::<Vec<_>>()
+        );
+
+        // Scan: the DB is authoritative, so the legacy-only session is not
+        // re-indexed from files.
+        let convs = connector.scan(&ctx).unwrap();
+        let ids: Vec<&str> = convs.iter().filter_map(|c| c.external_id.as_deref()).collect();
+        assert_eq!(ids, vec!["sess-db"], "only the DB session should be scanned");
+    }
+
+    /// Incremental edge case: the DB is read cleanly but `since_ts` filters out
+    /// every session (none updated recently), so no session is emitted. The
+    /// legacy fallback must STILL be skipped — gating on "a session was emitted"
+    /// would wrongly re-run the 100k+ file walk on every quiet incremental.
+    #[test]
+    fn db_supersedes_legacy_on_incremental_with_no_matching_db_sessions() {
+        let dir = TempDir::new().unwrap();
+
+        // DB session whose update timestamp is old (well before the since_ts below).
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute(
+            "INSERT INTO session (id, project_id, title, directory, time_updated) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "sess-db-old",
+                "proj-db",
+                "Old DB Session",
+                "/home/user/db",
+                "2020-01-01 00:00:00"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params![
+                "msg-db",
+                "sess-db-old",
+                r#"{"role":"user","time":{"created":1577836800000}}"#
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "part-db",
+                "msg-db",
+                "sess-db-old",
+                r#"{"type":"text","text":"old"}"#
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Legacy file storage in the same root, written now (fresh mtime), so it
+        // WOULD pass session_has_updates and be scanned if the fallback ran.
+        write_session(
+            dir.path(),
+            "proj-legacy",
+            &json!({"id": "sess-legacy", "title": "Legacy", "projectID": "proj-legacy"}),
+        );
+        write_message(
+            dir.path(),
+            "sess-legacy",
+            &json!({"id": "msg-legacy", "role": "user", "sessionID": "sess-legacy", "time": {"created": 1577836800000_i64}}),
+        );
+        write_part(
+            dir.path(),
+            "msg-legacy",
+            &json!({"id": "p-legacy", "messageID": "msg-legacy", "type": "text", "text": "legacy"}),
+        );
+
+        // since_ts (2023-11-14) is after the DB session's 2020 update time, so the
+        // DB stream reads cleanly but emits zero sessions.
+        let connector = OpenCodeConnector::new();
+        let ctx = ScanContext::local_default(dir.path().to_path_buf(), Some(1_700_000_000_000));
+        let convs = connector.scan(&ctx).unwrap();
+        assert!(
+            convs.is_empty(),
+            "DB was read (authoritative) but matched no sessions for this since_ts; \
+             the legacy fallback must not run, yet it emitted: {:?}",
+            convs
+                .iter()
+                .filter_map(|c| c.external_id.as_deref())
+                .collect::<Vec<_>>()
         );
     }
 }
