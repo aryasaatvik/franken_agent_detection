@@ -22,6 +22,7 @@ pub use types::DetectionResult;
 pub use types::{
     // Scan & provenance types
     LOCAL_SOURCE_ID,
+    LineageRelation,
     NormalizedConversation,
     NormalizedInvocation,
     NormalizedMessage,

@@ -464,6 +464,7 @@ impl CopilotConnector {
                             extra: request.clone(),
                             invocations: Vec::new(),
                             snippets: Vec::new(),
+                            ..Default::default()
                         });
                     }
                 }
@@ -492,6 +493,7 @@ impl CopilotConnector {
                             extra: response.clone(),
                             invocations: Vec::new(),
                             snippets: Vec::new(),
+                            ..Default::default()
                         });
                     }
                 }
@@ -539,6 +541,7 @@ impl CopilotConnector {
                     extra: msg.clone(),
                     invocations: Vec::new(),
                     snippets: Vec::new(),
+                    ..Default::default()
                 });
             }
         }
@@ -597,6 +600,7 @@ impl CopilotConnector {
             ended_at,
             metadata,
             messages,
+            ..Default::default()
         })
     }
 
@@ -726,6 +730,7 @@ impl CopilotConnector {
                 extra: event,
                 invocations: Vec::new(),
                 snippets: Vec::new(),
+                ..Default::default()
             });
         }
 
@@ -774,6 +779,7 @@ impl CopilotConnector {
             ended_at,
             metadata,
             messages,
+            ..Default::default()
         }])
     }
 
@@ -840,6 +846,7 @@ impl CopilotConnector {
                 extra: event.clone(),
                 invocations: Vec::new(),
                 snippets: Vec::new(),
+                ..Default::default()
             });
         }
 
@@ -894,6 +901,7 @@ impl CopilotConnector {
             ended_at,
             metadata,
             messages,
+            ..Default::default()
         }]
     }
 

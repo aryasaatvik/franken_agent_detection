@@ -328,6 +328,7 @@ fn parse_factory_session(path: &Path) -> Result<Option<NormalizedConversation>> 
                     extra: val,
                     invocations,
                     snippets: Vec::new(),
+                    ..Default::default()
                 });
             }
             // Skip other types: todo_state, tool_result, etc.
@@ -399,6 +400,7 @@ fn parse_factory_session(path: &Path) -> Result<Option<NormalizedConversation>> 
             "model": model_info,
         }),
         messages,
+        ..Default::default()
     }))
 }
 

@@ -458,6 +458,7 @@ impl GooseConnector {
                     "source": "sqlite",
                 }),
                 messages,
+                ..Default::default()
             });
         }
 
@@ -540,6 +541,7 @@ impl GooseConnector {
                     extra,
                     invocations,
                     snippets: Vec::new(),
+                    ..Default::default()
                 },
             ));
         }
@@ -999,6 +1001,7 @@ fn parse_goose_jsonl(path: &Path, session_id: &str) -> Result<NormalizedConversa
                 }),
                 invocations,
                 snippets: Vec::new(),
+                ..Default::default()
             },
         ));
     }
@@ -1033,6 +1036,7 @@ fn parse_goose_jsonl(path: &Path, session_id: &str) -> Result<NormalizedConversa
             "source": "jsonl",
         }),
         messages,
+        ..Default::default()
     })
 }
 

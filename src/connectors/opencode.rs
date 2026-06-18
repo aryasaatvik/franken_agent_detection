@@ -529,6 +529,7 @@ impl OpenCodeConnector {
                     "source": "sqlite",
                 }),
                 messages,
+                ..Default::default()
             });
         }
 
@@ -615,6 +616,7 @@ impl OpenCodeConnector {
                         }),
                         invocations: Vec::new(),
                         snippets: Vec::new(),
+                        ..Default::default()
                     },
                 });
         }
@@ -1006,6 +1008,7 @@ impl Connector for OpenCodeConnector {
                         "project_id": session.project_id,
                     }),
                     messages,
+                    ..Default::default()
                 });
             }
         }
@@ -1254,6 +1257,7 @@ fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<Normaliz
                 }),
                 invocations: Vec::new(),
                 snippets: Vec::new(),
+                ..Default::default()
             },
         ));
     }

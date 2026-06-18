@@ -224,6 +224,7 @@ impl HermesConnector {
                     "output_tokens": session.output_tokens,
                 }),
                 messages,
+                ..Default::default()
             });
         }
 
@@ -307,6 +308,7 @@ impl HermesConnector {
                 extra,
                 invocations,
                 snippets: Vec::new(),
+                ..Default::default()
             });
         }
 
@@ -543,6 +545,7 @@ mod tests {
                     serde_json::json!({"command": "ls", "workdir": "/home/user/project"}),
                 ),
             }],
+            ..Default::default()
         }];
         assert_eq!(
             HermesConnector::infer_workspace(&messages),
@@ -567,6 +570,7 @@ mod tests {
                 call_id: None,
                 arguments: Some(serde_json::json!({"path": "/home/user/project/src/main.rs"})),
             }],
+            ..Default::default()
         }];
         assert_eq!(
             HermesConnector::infer_workspace(&messages),

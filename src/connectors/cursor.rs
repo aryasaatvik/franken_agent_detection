@@ -343,7 +343,8 @@ impl CursorConnector {
 
         let prefix_len = prefix.len();
 
-        let rows = conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?")
+        let rows = conn
+            .prepare("SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?")
             .and_then(|mut stmt| {
                 stmt.query_map(params![prefix.as_str(), limit.as_str()], |row| {
                     let key: String = row.get(0)?;
@@ -608,6 +609,7 @@ impl CursorConnector {
                 extra: serde_json::json!({}),
                 invocations: Vec::new(),
                 snippets: Vec::new(),
+                ..Default::default()
             });
         }
 
@@ -676,6 +678,7 @@ impl CursorConnector {
                 "unifiedMode": val.get("unifiedMode").and_then(|v| v.as_str()),
             }),
             messages,
+            ..Default::default()
         })
     }
 
@@ -751,6 +754,7 @@ impl CursorConnector {
             extra: bubble.clone(),
             invocations: Vec::new(),
             snippets: Vec::new(),
+            ..Default::default()
         })
     }
 
@@ -848,6 +852,7 @@ impl CursorConnector {
             ended_at,
             metadata: serde_json::json!({"source": "cursor_aichat"}),
             messages,
+            ..Default::default()
         })
     }
 }

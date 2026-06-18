@@ -236,6 +236,7 @@ impl Connector for ClawdbotConnector {
                         extra: val,
                         invocations: Vec::new(),
                         snippets: Vec::new(),
+                        ..Default::default()
                     });
                 }
 
@@ -276,6 +277,7 @@ impl Connector for ClawdbotConnector {
                     ended_at,
                     metadata,
                     messages,
+                    ..Default::default()
                 });
             }
         }

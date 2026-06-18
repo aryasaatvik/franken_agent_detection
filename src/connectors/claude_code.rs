@@ -233,6 +233,7 @@ impl ClaudeCodeConnector {
             }),
             invocations: Vec::new(),
             snippets: Vec::new(),
+            ..Default::default()
         })
     }
 
@@ -553,6 +554,21 @@ fn scan_claude_with_callback_with_exclusions(
                     let invocations =
                         content_val.map_or_else(Vec::new, extract_invocations_from_content_blocks);
 
+                    // Promote lineage to typed fields BEFORE `val` is moved into
+                    // `extra` (and before compaction strips the raw blob on huge
+                    // sessions). `logicalParentUuid` bridges a compaction boundary
+                    // when there is no direct `parentUuid`.
+                    let msg_uid = val.get("uuid").and_then(|v| v.as_str()).map(String::from);
+                    let parent_msg_uid = val
+                        .get("parentUuid")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| val.get("logicalParentUuid").and_then(|v| v.as_str()))
+                        .map(String::from);
+                    let is_sidechain = val
+                        .get("isSidechain")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+
                     messages.push(NormalizedMessage {
                         idx: 0,
                         role: role.to_string(),
@@ -566,6 +582,9 @@ fn scan_claude_with_callback_with_exclusions(
                         },
                         invocations,
                         snippets: Vec::new(),
+                        msg_uid,
+                        parent_msg_uid,
+                        is_sidechain,
                     });
                 }
                 crate::types::reindex_messages(&mut messages);
@@ -659,6 +678,16 @@ fn scan_claude_with_callback_with_exclusions(
                             invocations: content_val
                                 .map_or_else(Vec::new, extract_invocations_from_content_blocks),
                             snippets: Vec::new(),
+                            msg_uid: item.get("uuid").and_then(|v| v.as_str()).map(String::from),
+                            parent_msg_uid: item
+                                .get("parentUuid")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| item.get("logicalParentUuid").and_then(|v| v.as_str()))
+                                .map(String::from),
+                            is_sidechain: item
+                                .get("isSidechain")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
                         });
                     }
                 }
@@ -703,6 +732,12 @@ fn scan_claude_with_callback_with_exclusions(
                     })
             });
 
+            // Promote thread id + branch to typed lineage fields. Cross-file
+            // resume/fork resolution (parent_external_id, lineage_relation) is a
+            // downstream cass pass; the connector only emits what one file knows.
+            let thread_external_id = session_id.clone();
+            let conv_git_branch = git_branch.clone();
+
             on_conversation(NormalizedConversation {
                 agent_slug: "claude_code".into(),
                 external_id: if source_kind == "claude_code_desktop_sidecar" {
@@ -733,6 +768,10 @@ fn scan_claude_with_callback_with_exclusions(
                     "bodyAvailable": source_kind != "claude_code_desktop_sidecar"
                 }),
                 messages,
+                thread_external_id,
+                parent_external_id: None,
+                lineage_relation: None,
+                git_branch: conv_git_branch,
             })?;
         }
     }

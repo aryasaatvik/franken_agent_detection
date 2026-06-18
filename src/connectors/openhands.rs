@@ -438,6 +438,7 @@ fn parse_conversation(
                     extra: Value::Object(extra),
                     invocations: Vec::new(),
                     snippets: Vec::new(),
+                    ..Default::default()
                 });
             }
             "ActionEvent" => {
@@ -491,6 +492,7 @@ fn parse_conversation(
                         arguments,
                     }],
                     snippets: Vec::new(),
+                    ..Default::default()
                 });
             }
             "ObservationEvent" => {
@@ -550,6 +552,7 @@ fn parse_conversation(
                     extra: Value::Object(extra),
                     invocations: Vec::new(),
                     snippets: Vec::new(),
+                    ..Default::default()
                 });
             }
             _ => {}
@@ -584,6 +587,7 @@ fn parse_conversation(
         ended_at,
         metadata,
         messages,
+        ..Default::default()
     })
 }
 
