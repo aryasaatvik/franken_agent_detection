@@ -919,12 +919,25 @@ impl Connector for OpenCodeConnector {
             if !scanned_dbs.insert(canonical) {
                 continue;
             }
-            // Stream this DB's sessions straight to the callback. A broken DB is
-            // logged and skipped, not fatal (matches the prior per-candidate
-            // error handling). seen_ids is updated as sessions are emitted.
-            if let Err(e) =
-                Self::stream_from_sqlite(&db, ctx.since_ts, &mut seen_ids, on_conversation)
-            {
+            // Stream this DB's sessions straight to the callback. A broken DB
+            // (open/prepare/query failure) is logged and skipped — not fatal,
+            // matching the prior per-candidate handling. But a callback error
+            // (the orchestrator failing to ingest a conversation) must PROPAGATE,
+            // not be swallowed by that DB-error skip — capture it separately so we
+            // can return it instead of reporting a false success. seen_ids is
+            // updated as sessions are emitted.
+            let mut callback_error: Option<anyhow::Error> = None;
+            let stream_result =
+                Self::stream_from_sqlite(&db, ctx.since_ts, &mut seen_ids, &mut |conv| {
+                    on_conversation(conv).map_err(|err| {
+                        callback_error = Some(err);
+                        anyhow::anyhow!("opencode: conversation callback failed")
+                    })
+                });
+            if let Some(err) = callback_error {
+                return Err(err);
+            }
+            if let Err(e) = stream_result {
                 tracing::debug!("opencode sqlite: failed to read {}: {e}", db.display());
             }
         }
@@ -1080,13 +1093,23 @@ fn looks_like_opencode_storage(path: &std::path::Path) -> bool {
     path.join("session").exists() && path.join("message").exists()
 }
 
-/// Count rows in `table`, returning `None` if the table does not exist.
-///
-/// `table` is always a hardcoded literal at the call sites below, so the
-/// format-string interpolation carries no injection risk.
-fn count_table_rows(conn: &Connection, table: &str) -> Option<i64> {
-    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
-        .ok()
+/// The closed set of tables the schema-drift guard probes. Keeping it an enum
+/// means the count query below is built from a compile-time string literal — the
+/// table name is never interpolated from a caller-supplied string.
+#[derive(Clone, Copy)]
+enum OpenCodeRowCount {
+    Message,
+    SessionMessage,
+}
+
+/// Count rows in one of the known OpenCode tables, returning `None` when the
+/// table does not exist (the query errors, which `.ok()` maps to `None`).
+fn count_known_table_rows(conn: &Connection, table: OpenCodeRowCount) -> Option<i64> {
+    let count_sql = match table {
+        OpenCodeRowCount::Message => "SELECT count(*) FROM message",
+        OpenCodeRowCount::SessionMessage => "SELECT count(*) FROM session_message",
+    };
+    conn.query_row(count_sql, [], |r| r.get(0)).ok()
 }
 
 /// Warn loudly when the `message`/`part` tables this connector reads are empty
@@ -1094,10 +1117,11 @@ fn count_table_rows(conn: &Connection, table: &str) -> Option<i64> {
 /// to a schema this connector does not yet read. Without this, the scan would
 /// silently return zero conversations and look like a successful no-op.
 fn warn_on_opencode_schema_drift(conn: &Connection, db_path: &Path) {
-    if count_table_rows(conn, "message").unwrap_or(0) != 0 {
+    if count_known_table_rows(conn, OpenCodeRowCount::Message).unwrap_or(0) != 0 {
         return;
     }
-    if let Some(session_message_rows) = count_table_rows(conn, "session_message")
+    if let Some(session_message_rows) =
+        count_known_table_rows(conn, OpenCodeRowCount::SessionMessage)
         && session_message_rows > 0
     {
         tracing::warn!(
@@ -1414,10 +1438,13 @@ fn cap_part_body(body: &str) -> String {
 
 /// Assemble message content from parts.
 ///
-/// Each part's body is capped at `MAX_PART_CONTENT_BYTES` and the assembled
-/// message at `MAX_MESSAGE_CONTENT_BYTES`, so one giant tool output (or a session
-/// with thousands of large parts) cannot balloon a single message's content.
-/// Output is byte-identical to the uncapped path for content under the caps.
+/// Each part's body is capped at `MAX_PART_CONTENT_BYTES`. The assembled message
+/// is bounded by `MAX_MESSAGE_CONTENT_BYTES` as a SOFT cap: the check fires before
+/// appending each piece, so the piece that crosses the threshold is still added —
+/// the true upper bound is `MAX_MESSAGE_CONTENT_BYTES + MAX_PART_CONTENT_BYTES`
+/// (~1.25 MiB) plus the truncation marker. That keeps one giant tool output (or a
+/// session with thousands of large parts) from ballooning a single message's
+/// content. Output is byte-identical to the uncapped path for content under the caps.
 fn assemble_content_from_parts(parts: &[PartInfo]) -> String {
     let mut content_pieces: Vec<String> = Vec::new();
     let mut total_bytes = 0usize;
