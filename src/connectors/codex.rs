@@ -92,9 +92,32 @@ impl CodexConnector {
     fn sessions_dir_for_explicit_file(path: &Path) -> Option<PathBuf> {
         path.ancestors()
             .find(|ancestor| {
-                ancestor.file_name().and_then(|name| name.to_str()) == Some("sessions")
+                matches!(
+                    ancestor.file_name().and_then(|name| name.to_str()),
+                    Some("sessions" | "archived_sessions")
+                )
             })
             .map(Path::to_path_buf)
+    }
+
+    /// Rollout files under the home's `archived_sessions/` store, if present.
+    /// Codex moves a session's rollout here wholesale when it is archived; the
+    /// on-disk format is identical to active rollouts. Off by default — only
+    /// walked when `ScanContext::include_archived_sessions` is set, so
+    /// deliberately-archived history stays out of the index unless requested.
+    fn archived_rollout_files(home: &Path) -> Vec<PathBuf> {
+        let dir = home.join("archived_sessions");
+        let mut out = Vec::new();
+        if !dir.exists() {
+            return out;
+        }
+        for entry in WalkDir::new(&dir).into_iter().flatten() {
+            if entry.file_type().is_file() && Self::is_rollout_file(entry.path()) {
+                out.push(entry.path().to_path_buf());
+            }
+        }
+        out.sort();
+        out
     }
 
     fn rollout_files(root: &Path) -> Vec<PathBuf> {
@@ -237,9 +260,12 @@ impl CodexConnector {
                 continue;
             }
 
-            let files = explicit_file
+            let mut files = explicit_file
                 .clone()
                 .map_or_else(|| Self::rollout_files(&home), |path| vec![path]);
+            if explicit_file.is_none() && ctx.include_archived_sessions {
+                files.extend(Self::archived_rollout_files(&home));
+            }
 
             for file in files {
                 if !seen_files.insert(dedupe_path_key(&file)) {
@@ -372,9 +398,12 @@ fn scan_codex_with_callback(
             continue;
         }
 
-        let files = explicit_file
+        let mut files = explicit_file
             .clone()
             .map_or_else(|| CodexConnector::rollout_files(&home), |path| vec![path]);
+        if explicit_file.is_none() && ctx.include_archived_sessions {
+            files.extend(CodexConnector::archived_rollout_files(&home));
+        }
         let sessions_dir = explicit_file
             .as_ref()
             .and_then(|path| CodexConnector::sessions_dir_for_explicit_file(path))
@@ -893,6 +922,64 @@ mod tests {
         assert_eq!(convs[0].messages.len(), 2);
         assert_eq!(convs[0].messages[0].content, "Hello Codex");
         assert_eq!(convs[0].messages[1].content, "Hi there!");
+    }
+
+    // =====================================================
+    // archived_sessions Tests (opt-in)
+    // =====================================================
+
+    #[test]
+    fn archived_rollout_files_walks_archived_sessions_dir() {
+        let dir = TempDir::new().unwrap();
+        let archived = dir.path().join("archived_sessions");
+        fs::create_dir_all(&archived).unwrap();
+        fs::write(archived.join("rollout-arch.jsonl"), "{}").unwrap();
+        fs::write(archived.join("config.json"), "{}").unwrap();
+
+        let files = CodexConnector::archived_rollout_files(dir.path());
+        assert_eq!(files.len(), 1);
+        assert!(files[0].to_str().unwrap().contains("rollout-arch.jsonl"));
+    }
+
+    #[test]
+    fn archived_rollout_files_empty_when_no_archived_dir() {
+        let dir = TempDir::new().unwrap();
+        assert!(CodexConnector::archived_rollout_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn scan_excludes_archived_by_default_includes_when_opted_in() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        let archived = codex_dir.join("archived_sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&archived).unwrap();
+
+        let active = "{\"type\":\"response_item\",\"timestamp\":\"2025-12-01T10:00:00Z\",\"payload\":{\"role\":\"user\",\"content\":\"active session\"}}\n";
+        let arch = "{\"type\":\"response_item\",\"timestamp\":\"2025-12-01T09:00:00Z\",\"payload\":{\"role\":\"user\",\"content\":\"archived session\"}}\n";
+        fs::write(sessions.join("rollout-active.jsonl"), active).unwrap();
+        fs::write(archived.join("rollout-archived.jsonl"), arch).unwrap();
+
+        let connector = CodexConnector::new();
+
+        // Default: archived excluded.
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1, "archived must be excluded by default");
+        assert!(convs[0].messages.iter().any(|m| m.content == "active session"));
+
+        // Opt-in: archived included alongside active.
+        let mut ctx = ScanContext::local_default(codex_dir.clone(), None);
+        ctx.include_archived_sessions = true;
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 2, "archived must be included when opted in");
+        let contents: Vec<_> = convs
+            .iter()
+            .flat_map(|c| c.messages.iter().map(|m| m.content.clone()))
+            .collect();
+        assert!(contents.iter().any(|c| c == "active session"));
+        assert!(contents.iter().any(|c| c == "archived session"));
     }
 
     #[test]

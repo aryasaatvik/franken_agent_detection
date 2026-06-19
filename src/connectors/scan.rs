@@ -138,6 +138,11 @@ pub struct ScanContext {
 
     /// High-water mark for incremental indexing (milliseconds since epoch).
     pub since_ts: Option<i64>,
+
+    /// Include connector "archived" session stores in discovery (e.g. Codex
+    /// `~/.codex/archived_sessions`). Off by default; opted into via cass config
+    /// so deliberately-archived history stays out of the index unless requested.
+    pub include_archived_sessions: bool,
 }
 
 impl ScanContext {
@@ -148,6 +153,7 @@ impl ScanContext {
             data_dir,
             scan_roots: Vec::new(),
             since_ts,
+            include_archived_sessions: false,
         }
     }
 
@@ -162,6 +168,7 @@ impl ScanContext {
             data_dir,
             scan_roots,
             since_ts,
+            include_archived_sessions: false,
         }
     }
 
