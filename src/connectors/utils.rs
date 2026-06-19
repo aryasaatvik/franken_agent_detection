@@ -212,8 +212,22 @@ fn extract_content_part(item: &serde_json::Value) -> Option<String> {
     let item_type = item.get("type").and_then(|v| v.as_str());
 
     if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-        if item_type.is_none() || item_type == Some("text") || item_type == Some("input_text") {
+        if item_type.is_none()
+            || item_type == Some("text")
+            || item_type == Some("input_text")
+            || item_type == Some("output_text")
+        {
             return Some(text.to_string());
+        }
+    }
+
+    // Claude extended-thinking block: the reasoning text lives in `thinking`,
+    // not `text`. Surface it so assistant reasoning isn't dropped (empty turns).
+    if item_type == Some("thinking") {
+        if let Some(thinking) = item.get("thinking").and_then(|v| v.as_str()) {
+            if !thinking.is_empty() {
+                return Some(thinking.to_string());
+            }
         }
     }
 
@@ -236,6 +250,18 @@ fn extract_content_part(item: &serde_json::Value) -> Option<String> {
             return Some(format!("[Tool: {name}]"));
         }
         return Some(format!("[Tool: {name} - {desc}]"));
+    }
+
+    // Claude tool_result block: the output lives in `content`, which is either a
+    // plain string or a nested content-block array. Surface it so tool outputs
+    // aren't dropped (empty user turns).
+    if item_type == Some("tool_result") {
+        if let Some(content) = item.get("content") {
+            let flattened = flatten_content(content);
+            if !flattened.is_empty() {
+                return Some(flattened);
+            }
+        }
     }
 
     None
@@ -448,6 +474,36 @@ mod tests {
     fn flatten_content_input_text_block() {
         let val = json!([{"type": "input_text", "text": "Codex input"}]);
         assert_eq!(flatten_content(&val), "Codex input");
+    }
+
+    #[test]
+    fn flatten_content_output_text_block() {
+        // Codex assistant messages use `output_text`; dropping it blanked every
+        // assistant turn in exports (only user `input_text` survived).
+        let val = json!([{"type": "output_text", "text": "Codex assistant reply"}]);
+        assert_eq!(flatten_content(&val), "Codex assistant reply");
+    }
+
+    #[test]
+    fn flatten_content_thinking_block() {
+        // Claude extended-thinking puts reasoning in `thinking`, not `text`;
+        // dropping it left empty assistant turns in exports.
+        let val = json!([{"type": "thinking", "thinking": "Let me reason about this.", "signature": "sig"}]);
+        assert_eq!(flatten_content(&val), "Let me reason about this.");
+    }
+
+    #[test]
+    fn flatten_content_tool_result_string_content() {
+        // Claude tool_result with a plain-string `content` (tool output).
+        let val = json!([{"type": "tool_result", "tool_use_id": "t1", "content": "command output"}]);
+        assert_eq!(flatten_content(&val), "command output");
+    }
+
+    #[test]
+    fn flatten_content_tool_result_array_content() {
+        // Claude tool_result whose `content` is a nested content-block array.
+        let val = json!([{"type": "tool_result", "content": [{"type": "text", "text": "nested output"}]}]);
+        assert_eq!(flatten_content(&val), "nested output");
     }
 
     #[test]
