@@ -404,15 +404,18 @@ fn scan_codex_with_callback(
         if explicit_file.is_none() && ctx.include_archived_sessions {
             files.extend(CodexConnector::archived_rollout_files(&home));
         }
-        let sessions_dir = explicit_file
-            .as_ref()
-            .and_then(|path| CodexConnector::sessions_dir_for_explicit_file(path))
-            .unwrap_or_else(|| CodexConnector::sessions_dir(&home));
-
         for file in files {
             if !seen_files.insert(dedupe_path_key(&file)) {
                 continue;
             }
+            // Compute the session-store root PER FILE: an archived rollout lives
+            // under `archived_sessions/`, so a single `home/sessions` base would
+            // fail `strip_prefix` for it and fall back to a bare file stem —
+            // losing path context and risking an external_id collision with an
+            // active session of the same name. `sessions_dir_for_explicit_file`
+            // already recognises both roots.
+            let sessions_dir = CodexConnector::sessions_dir_for_explicit_file(&file)
+                .unwrap_or_else(|| CodexConnector::sessions_dir(&home));
             let source_path = file.clone();
             let file_metadata = match CodexConnector::file_metadata_if_modified(&file, ctx.since_ts)
             {
@@ -980,6 +983,18 @@ mod tests {
             .collect();
         assert!(contents.iter().any(|c| c == "active session"));
         assert!(contents.iter().any(|c| c == "archived session"));
+
+        // external_id is derived from each file's OWN store root, so an archived
+        // rollout keeps a rooted id instead of collapsing to a bare stem that
+        // could collide with an active session of the same name.
+        let id_for = |marker: &str| {
+            convs
+                .iter()
+                .find(|c| c.messages.iter().any(|m| m.content == marker))
+                .and_then(|c| c.external_id.clone())
+        };
+        assert_eq!(id_for("archived session").as_deref(), Some("rollout-archived"));
+        assert_eq!(id_for("active session").as_deref(), Some("rollout-active"));
     }
 
     #[test]
