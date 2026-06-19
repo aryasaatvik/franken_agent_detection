@@ -90,14 +90,20 @@ impl CodexConnector {
     }
 
     fn sessions_dir_for_explicit_file(path: &Path) -> Option<PathBuf> {
-        path.ancestors()
-            .find(|ancestor| {
-                matches!(
-                    ancestor.file_name().and_then(|name| name.to_str()),
-                    Some("sessions" | "archived_sessions")
-                )
-            })
-            .map(Path::to_path_buf)
+        for ancestor in path.ancestors() {
+            match ancestor.file_name().and_then(|name| name.to_str()) {
+                // Active store: strip `sessions/` itself so the external_id is the
+                // date-rooted relative path (its historical shape, unchanged).
+                Some("sessions") => return Some(ancestor.to_path_buf()),
+                // Archived store: strip only up to the PARENT of `archived_sessions`
+                // so the external_id keeps its `archived_sessions/` prefix. Stripping
+                // the dir itself would yield the bare stem and collide with an active
+                // session of the same filename.
+                Some("archived_sessions") => return ancestor.parent().map(Path::to_path_buf),
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Rollout files under the home's `archived_sessions/` store, if present.
@@ -961,8 +967,9 @@ mod tests {
 
         let active = "{\"type\":\"response_item\",\"timestamp\":\"2025-12-01T10:00:00Z\",\"payload\":{\"role\":\"user\",\"content\":\"active session\"}}\n";
         let arch = "{\"type\":\"response_item\",\"timestamp\":\"2025-12-01T09:00:00Z\",\"payload\":{\"role\":\"user\",\"content\":\"archived session\"}}\n";
-        fs::write(sessions.join("rollout-active.jsonl"), active).unwrap();
-        fs::write(archived.join("rollout-archived.jsonl"), arch).unwrap();
+        // Same filename in both stores, to exercise the collision the rooted id prevents.
+        fs::write(sessions.join("rollout-dup.jsonl"), active).unwrap();
+        fs::write(archived.join("rollout-dup.jsonl"), arch).unwrap();
 
         let connector = CodexConnector::new();
 
@@ -984,17 +991,23 @@ mod tests {
         assert!(contents.iter().any(|c| c == "active session"));
         assert!(contents.iter().any(|c| c == "archived session"));
 
-        // external_id is derived from each file's OWN store root, so an archived
-        // rollout keeps a rooted id instead of collapsing to a bare stem that
-        // could collide with an active session of the same name.
+        // Same-name rollouts in different stores must NOT collide: the active id
+        // is rooted under sessions/ (here the bare stem), while the archived id
+        // keeps its `archived_sessions/` prefix.
         let id_for = |marker: &str| {
             convs
                 .iter()
                 .find(|c| c.messages.iter().any(|m| m.content == marker))
                 .and_then(|c| c.external_id.clone())
         };
-        assert_eq!(id_for("archived session").as_deref(), Some("rollout-archived"));
-        assert_eq!(id_for("active session").as_deref(), Some("rollout-active"));
+        let active_id = id_for("active session");
+        let archived_id = id_for("archived session");
+        assert_eq!(active_id.as_deref(), Some("rollout-dup"));
+        assert_eq!(archived_id.as_deref(), Some("archived_sessions/rollout-dup"));
+        assert_ne!(
+            active_id, archived_id,
+            "same-name rollouts in different stores must get distinct external_ids"
+        );
     }
 
     #[test]
