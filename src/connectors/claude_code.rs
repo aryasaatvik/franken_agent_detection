@@ -518,6 +518,45 @@ fn scan_claude_with_callback_with_exclusions(
                         || (entry_type == Some("message")
                             && matches!(role_hint, Some("user" | "assistant")));
                     if !is_user_assistant {
+                        // A continuation file's compaction summary points its
+                        // `parentUuid` at the PREDECESSOR file's trailing
+                        // `type:"system"` boundary record — otherwise dropped here,
+                        // leaving the cross-file compaction edge dangling. Emit that
+                        // boundary as a minimal system message so its uuid is a
+                        // resolvable `msg_uid` and the downstream lineage resolver
+                        // can reconnect the two sessions. Only `system` rows that
+                        // carry a uuid qualify (plain metadata rows like
+                        // `custom-title` have none), so this stays rare. The marker
+                        // content is a sentinel: cass's direct-file export path
+                        // re-parses the raw jsonl and skips this record, so the
+                        // boundary lives in the index for lineage only.
+                        if entry_type == Some("system") {
+                            if let Some(uid) = val
+                                .get("uuid")
+                                .and_then(|v| v.as_str())
+                                .filter(|u| !u.is_empty())
+                            {
+                                messages.push(NormalizedMessage {
+                                    idx: 0,
+                                    role: "system".to_string(),
+                                    author: None,
+                                    created_at: val.get("timestamp").and_then(parse_timestamp),
+                                    content: "[compaction boundary]".to_string(),
+                                    extra: Value::Null,
+                                    snippets: Vec::new(),
+                                    invocations: Vec::new(),
+                                    msg_uid: Some(uid.to_string()),
+                                    parent_msg_uid: val
+                                        .get("parentUuid")
+                                        .and_then(|v| v.as_str())
+                                        .or_else(|| {
+                                            val.get("logicalParentUuid").and_then(|v| v.as_str())
+                                        })
+                                        .map(String::from),
+                                    is_sidechain: false,
+                                });
+                            }
+                        }
                         continue;
                     }
 
@@ -1016,6 +1055,47 @@ mod tests {
         assert_eq!(convs[0].messages[0].content, "Hello Claude");
         assert_eq!(convs[0].messages[1].role, "assistant");
         assert!(convs[0].messages[1].content.contains("How can I help"));
+    }
+
+    #[test]
+    fn scan_emits_dropped_system_boundary_as_resolvable_message() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+
+        // A continuation file: a `type:"system"` boundary record carrying a uuid
+        // (the predecessor leaf a compaction-summary `parentUuid` points at),
+        // then the compaction summary and a normal turn. The boundary must be
+        // emitted as a minimal system message so its uuid is a resolvable
+        // `msg_uid` and a downstream resolver can reconnect the continuation to
+        // its predecessor.
+        let session_file = claude_dir.join("session.jsonl");
+        let content = r#"{"type":"system","uuid":"boundary-uid-123","parentUuid":null,"content":""}
+{"type":"user","uuid":"u1","parentUuid":"boundary-uid-123","isCompactSummary":true,"timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"This session is being continued from a previous conversation."}}
+{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2025-12-01T10:00:01Z","message":{"role":"assistant","content":"Picking up where we left off."}}
+"#;
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        // boundary system message + summary + assistant.
+        assert_eq!(convs[0].messages.len(), 3);
+        let boundary = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.msg_uid.as_deref() == Some("boundary-uid-123"))
+            .expect("boundary system message must be emitted with its uuid as msg_uid");
+        assert_eq!(boundary.role, "system");
+        // The summary's parent edge points at that boundary uid (the dangling
+        // cross-file edge the resolver reconnects).
+        let summary = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.content.contains("being continued"))
+            .expect("summary message present");
+        assert_eq!(summary.parent_msg_uid.as_deref(), Some("boundary-uid-123"));
     }
 
     #[test]
