@@ -245,11 +245,13 @@ impl OpenCodeConnector {
             }
         }
 
-        db_candidates.extend(
-            Self::sqlite_db_candidates()
-                .into_iter()
-                .map(ScanRoot::local),
-        );
+        if ctx.data_dir.as_os_str().is_empty() && ctx.scan_roots.is_empty() {
+            db_candidates.extend(
+                Self::sqlite_db_candidates()
+                    .into_iter()
+                    .map(ScanRoot::local),
+            );
+        }
 
         let mut seen = HashSet::new();
         db_candidates.retain(|root| seen.insert(root.path.clone()));
@@ -261,7 +263,10 @@ impl OpenCodeConnector {
         if ctx.use_default_detection() {
             if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
                 storage_roots.push(ScanRoot::local(ctx.data_dir.clone()));
-            } else if let Some(root) = Self::storage_root() {
+            } else if ctx.data_dir.as_os_str().is_empty()
+                && ctx.scan_roots.is_empty()
+                && let Some(root) = Self::storage_root()
+            {
                 storage_roots.push(ScanRoot::local(root));
             }
         } else {
@@ -922,7 +927,12 @@ impl Connector for OpenCodeConnector {
             }
         }
 
-        db_candidates.extend(Self::sqlite_db_candidates());
+        // A non-empty explicit data directory is already a hermetic source
+        // boundary (and is how connector tests provide fixtures). Only probe
+        // the host's default locations for the empty/default context.
+        if ctx.data_dir.as_os_str().is_empty() && ctx.scan_roots.is_empty() {
+            db_candidates.extend(Self::sqlite_db_candidates());
+        }
 
         // Deduplicate while preserving priority order.
         {
@@ -986,7 +996,10 @@ impl Connector for OpenCodeConnector {
         if ctx.use_default_detection() {
             if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
                 storage_roots.push(ctx.data_dir.clone());
-            } else if let Some(root) = Self::storage_root() {
+            } else if ctx.data_dir.as_os_str().is_empty()
+                && ctx.scan_roots.is_empty()
+                && let Some(root) = Self::storage_root()
+            {
                 storage_roots.push(root);
             }
         } else {

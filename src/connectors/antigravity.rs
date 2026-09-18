@@ -494,6 +494,7 @@ fn message(
         extra: Value::Object(extra),
         invocations,
         snippets: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -700,6 +701,7 @@ fn parse_conversation(
         ended_at,
         metadata: Value::Object(metadata),
         messages,
+        ..Default::default()
     })
 }
 

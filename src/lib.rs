@@ -34,6 +34,8 @@ pub use types::{
     reindex_messages,
 };
 // Re-export connector infrastructure at crate root.
+#[cfg(all(feature = "connectors", feature = "antigravity"))]
+pub use connectors::antigravity::AntigravityConnector;
 #[cfg(feature = "chatgpt")]
 pub use connectors::chatgpt::ChatGptConnector;
 #[cfg(feature = "codebuff")]
@@ -71,8 +73,8 @@ pub use connectors::{
 };
 #[cfg(all(feature = "connectors", feature = "upstream-extras"))]
 pub use connectors::{
-    antigravity::AntigravityConnector, grok::GrokConnector, kimi::KimiConnector,
-    kiro::KiroConnector, omp::OmpConnector, prime_agent::PrimeAgentConnector,
+    grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector, omp::OmpConnector,
+    prime_agent::PrimeAgentConnector,
 };
 
 use serde::{Deserialize, Serialize};
@@ -2140,14 +2142,27 @@ mod tests {
             let detection_only: HashSet<&str> = HashSet::from(["continue", "windsurf"]);
             let feature_gated: HashMap<&str, bool> = HashMap::from([
                 ("chatgpt", cfg!(feature = "chatgpt")),
-                ("codebuff", cfg!(feature = "codebuff")),
+                (
+                    "codebuff",
+                    cfg!(all(feature = "codebuff", feature = "upstream-extras")),
+                ),
                 ("crush", cfg!(feature = "crush")),
                 ("cursor", cfg!(feature = "cursor")),
                 ("goose", cfg!(feature = "goose")),
-                ("grok_bot", cfg!(feature = "grok-bot")),
+                (
+                    "grok_bot",
+                    cfg!(all(feature = "grok-bot", feature = "upstream-extras")),
+                ),
                 ("hermes", cfg!(feature = "hermes")),
                 ("opencode", cfg!(feature = "opencode")),
                 ("shelley", cfg!(feature = "shelley")),
+                ("antigravity", cfg!(feature = "antigravity")),
+                ("grok", cfg!(feature = "upstream-extras")),
+                ("kimi", cfg!(feature = "upstream-extras")),
+                ("kiro", cfg!(feature = "upstream-extras")),
+                ("muse", cfg!(feature = "upstream-extras")),
+                ("omp", cfg!(feature = "upstream-extras")),
+                ("prime_agent", cfg!(feature = "upstream-extras")),
             ]);
             // Factory slugs are the connector-native names (e.g. `copilot`
             // for VS Code Copilot chat, which this registry knows as

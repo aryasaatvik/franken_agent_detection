@@ -62,6 +62,7 @@ hermes = ["connectors", "dep:rusqlite", "dep:urlencoding"]
 # Crush: SQLite database access for Charm's Crush agent
 crush = ["connectors", "dep:rusqlite"]
 devin = ["connectors", "dep:rusqlite", "dep:urlencoding"]
+antigravity = ["connectors"]
 grok-bot = ["connectors"]
 codebuff = ["connectors"]
 shelley = ["connectors", "dep:rusqlite", "dep:blake3", "dep:base64", "dep:url"]
@@ -72,7 +73,7 @@ copilot-vscdb = ["connectors", "dep:rusqlite"]
 # production all-connectors profile until that pass is complete.
 upstream-extras = ["connectors", "codebuff", "grok-bot"]
 # All connectors enabled
-all-connectors = ["connectors", "chatgpt", "cursor", "devin", "opencode", "goose", "hermes", "crush", "shelley", "copilot-vscdb"]
+all-connectors = ["connectors", "chatgpt", "cursor", "devin", "antigravity", "opencode", "goose", "hermes", "crush", "shelley", "copilot-vscdb"]
 
 [dev-dependencies]
 tempfile = "3"

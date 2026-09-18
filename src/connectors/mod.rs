@@ -4,7 +4,7 @@
 
 pub mod aider;
 pub mod amp;
-#[cfg(feature = "upstream-extras")]
+#[cfg(feature = "antigravity")]
 pub mod antigravity;
 #[cfg(feature = "chatgpt")]
 pub mod chatgpt;
@@ -291,7 +291,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("clawdbot", || Box::new(clawdbot::ClawdbotConnector::new())),
         ("vibe", || Box::new(vibe::VibeConnector::new())),
         ("amp", || Box::new(amp::AmpConnector::new())),
-        #[cfg(feature = "upstream-extras")]
+        #[cfg(feature = "antigravity")]
         ("antigravity", || {
             Box::new(antigravity::AntigravityConnector::new())
         }),
