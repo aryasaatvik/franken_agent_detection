@@ -271,6 +271,11 @@ fn parse_session(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
             extra,
             snippets: Vec::new(),
             invocations,
+            msg_uid: Some(id.to_owned()),
+            parent_msg_uid: record
+                .get("parentId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             ..Default::default()
         });
     }
@@ -488,6 +493,7 @@ mod tests {
             "Looking first\nread_files: {\"paths\":[\"src/main.rs\"]}\nneedle is on line 7\nNested assessment\nPreserve the original\nFound the needle"
         );
         assert_eq!(conv.messages[1].extra["codebuff_message_id"], "ai-native-2");
+        assert_eq!(conv.messages[1].msg_uid.as_deref(), Some("ai-native-2"));
         assert_eq!(conv.messages[1].extra["credits"], 1.25);
         assert_eq!(conv.messages[1].extra["blocks"], records()[1]["blocks"]);
         assert!(conv.messages[1].extra["metadata"].get("runState").is_none());
@@ -499,6 +505,10 @@ mod tests {
         );
         assert_eq!(conv.messages[2].author.as_deref(), Some("Reviewer"));
         assert_eq!(conv.messages[2].extra["parentId"], "ai-native-2");
+        assert_eq!(
+            conv.messages[2].parent_msg_uid.as_deref(),
+            Some("ai-native-2")
+        );
         assert_eq!(conv.metadata["shared_lineage"], true);
         assert_eq!(conv.metadata["display_name"], "Codebuff / Freebuff");
         assert!(conv.metadata.get("writer_product").is_none());
