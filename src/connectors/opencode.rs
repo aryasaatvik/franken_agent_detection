@@ -578,10 +578,10 @@ impl OpenCodeConnector {
                 if v2_row_count == 0 {
                     continue;
                 }
-                if !seen_ids.insert(session.id.clone()) {
+                if messages.is_empty() {
                     continue;
                 }
-                if messages.is_empty() {
+                if !seen_ids.insert(session.id.clone()) {
                     continue;
                 }
                 let msg_started = messages.iter().filter_map(|m| m.created_at).min();
@@ -1420,7 +1420,7 @@ fn v2_assistant_content(value: &serde_json::Value) -> String {
                 let input = state.and_then(|s| s.get("input")).map(compact_json);
                 let mut tool = format!("[Tool: {name}]");
                 if let Some(input) = input.filter(|text| !text.is_empty()) {
-                    let _ = write!(tool, "\nInput: {input}");
+                    let _ = write!(tool, "\nInput: {}", cap_part_body(&input));
                 }
                 if let Some(text) = state
                     .and_then(|s| s.get("content"))
@@ -1436,21 +1436,30 @@ fn v2_assistant_content(value: &serde_json::Value) -> String {
                     })
                     .filter(|text| !text.is_empty())
                 {
-                    let _ = write!(tool, "\n{text}");
+                    let _ = write!(tool, "\n{}", cap_part_body(&text));
                 }
                 if let Some(output) = state
                     .and_then(|s| s.get("output"))
                     .and_then(serde_json::Value::as_str)
                 {
-                    let _ = write!(tool, "\nOutput: {output}");
+                    let _ = write!(tool, "\nOutput: {}", cap_part_body(output));
                 }
-                pieces.push(tool);
+                pieces.push(cap_part_body(&tool));
             }
             // Reasoning is intentionally excluded by the content policy.
             _ => {}
         }
     }
-    pieces.join("\n\n")
+    cap_v2_message_body(&pieces.join("\n\n"))
+}
+
+fn cap_v2_message_body(body: &str) -> String {
+    let (head, truncated) = truncate_on_char_boundary(body, MAX_MESSAGE_CONTENT_BYTES);
+    if truncated {
+        format!("{head}\n[… message content truncated]")
+    } else {
+        head.to_string()
+    }
 }
 
 fn compact_json(value: &serde_json::Value) -> String {
@@ -3589,10 +3598,48 @@ mod tests {
             ],
         )
         .unwrap();
+        // V2 has rows for this session, but none are usable under the content
+        // policy. Legacy content must remain recoverable.
+        conn.execute(
+            "INSERT INTO session_v2 (id, title, version) VALUES (?1, ?2, ?3)",
+            params!["fallback", "Fallback", 2_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "v2-reasoning",
+                "fallback",
+                0_i64,
+                "assistant",
+                r#"{"content":[{"type":"reasoning","text":"omitted"}]}"#
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["fallback", "Legacy fallback"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["legacy-f", "fallback", r#"{"role":"user"}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "part-f",
+                "legacy-f",
+                "fallback",
+                r#"{"type":"text","text":"fallback content"}"#
+            ],
+        )
+        .unwrap();
         drop(conn);
 
         let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
-        assert_eq!(convs.len(), 2);
+        assert_eq!(convs.len(), 3);
         let both = convs
             .iter()
             .find(|c| c.external_id.as_deref() == Some("both"))
@@ -3604,6 +3651,31 @@ mod tests {
             .find(|c| c.external_id.as_deref() == Some("legacy-only"))
             .unwrap();
         assert_eq!(legacy.messages[0].content, "legacy retained");
+        let fallback = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some("fallback"))
+            .unwrap();
+        assert_eq!(fallback.messages[0].content, "fallback content");
+    }
+
+    #[test]
+    fn v2_tool_content_respects_message_limit() {
+        let huge = "x".repeat(MAX_PART_CONTENT_BYTES);
+        let content_blocks: Vec<_> = (0..6)
+            .map(|_| {
+                json!({
+                    "type": "tool",
+                    "name": "cat",
+                    "state": {"input": huge, "content": [{"text": "result"}], "output": "done"}
+                })
+            })
+            .collect();
+        let value = json!({
+            "content": content_blocks
+        });
+        let content = v2_assistant_content(&value);
+        assert!(content.len() <= MAX_MESSAGE_CONTENT_BYTES + 128);
+        assert!(content.contains("message content truncated"));
     }
 
     #[test]
