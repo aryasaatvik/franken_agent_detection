@@ -48,6 +48,48 @@ pub(crate) fn path_is_excluded(path: &Path, excluded_paths: &[PathBuf]) -> bool 
         .any(|excluded| path == excluded || path.starts_with(excluded))
 }
 
+/// Maximum session-store file size connectors will read into memory
+/// (100 MiB), matching the chatgpt connector's policy.
+pub(crate) const MAX_SCAN_FILE_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Read a session-store file to a string under the project's size cap.
+///
+/// Enforces [`MAX_SCAN_FILE_BYTES`] twice — a cheap pre-read stat skips the
+/// common oversized case, and a post-read backstop covers metadata-error and
+/// grow-between-stat-and-read races (the e253bdb bypass class). Returns
+/// `Ok(None)` when the file exceeds the cap; callers decide how to log it.
+pub(crate) fn read_capped(path: &Path) -> std::io::Result<Option<String>> {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() > MAX_SCAN_FILE_BYTES {
+            return Ok(None);
+        }
+    }
+    let content = std::fs::read_to_string(path)?;
+    if content.len() as u64 > MAX_SCAN_FILE_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(content))
+}
+
+/// True when a user message is harness-injected context rather than a
+/// human-authored prompt (`# AGENTS.md instructions …`,
+/// `<environment_context>`, `<session_context>`, `<user_instructions>`).
+///
+/// Used for TITLE selection only: the records stay in the timeline, but
+/// letting them seed a conversation title yields boilerplate for a large
+/// share of real sessions (3/12 recently-modified codex sessions sampled).
+#[must_use]
+pub(crate) fn is_injected_context_message(content: &str) -> bool {
+    const PREFIXES: [&str; 4] = [
+        "# AGENTS.md instructions",
+        "<environment_context>",
+        "<session_context>",
+        "<user_instructions>",
+    ];
+    let trimmed = content.trim_start();
+    PREFIXES.iter().any(|prefix| trimmed.starts_with(prefix))
+}
+
 /// Build a deduplication key for hot scan loops without paying the full
 /// `canonicalize()` syscall cost on every ordinary file.
 ///
@@ -64,6 +106,38 @@ pub(crate) fn dedupe_path_key(path: &std::path::Path) -> PathBuf {
         }
         _ => path.to_path_buf(),
     }
+}
+
+/// Minimal percent-decoding for URI path components (RFC 3986).
+///
+/// Decodes `%XX` byte escapes and leaves every other byte untouched;
+/// malformed escapes (`%` not followed by two hex digits) pass through
+/// verbatim. Invalid UTF-8 in decoded output is replaced per
+/// [`String::from_utf8_lossy`], which is acceptable for workspace-path
+/// best-effort inference.
+#[must_use]
+pub fn percent_decode_utf8(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos] == b'%'
+            && pos + 2 < bytes.len()
+            && bytes[pos + 1].is_ascii_hexdigit()
+            && bytes[pos + 2].is_ascii_hexdigit()
+        {
+            let hi = (bytes[pos + 1] as char).to_digit(16).unwrap_or(0);
+            let lo = (bytes[pos + 2] as char).to_digit(16).unwrap_or(0);
+            // Both digits passed `is_ascii_hexdigit`, so the value is at
+            // most 0xFF; the fallback is unreachable.
+            out.push(u8::try_from(hi * 16 + lo).unwrap_or_default());
+            pos += 3;
+        } else {
+            out.push(bytes[pos]);
+            pos += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Check if a file was modified since the given timestamp.
@@ -89,6 +163,11 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
     if let Some(ts) = val.as_i64() {
         let ts = if (0..100_000_000_000).contains(&ts) {
             ts.saturating_mul(1000)
+        } else if (100_000_000_000_000..=100_000_000_000_000_000).contains(&ts) {
+            // Microsecond epoch: 1e14–1e17 µs spans 1973–5138. No
+            // in-scope producer emits these today, but a µs value read as
+            // milliseconds lands ~55 millennia out, so band it explicitly.
+            ts / 1000
         } else {
             ts
         };
@@ -104,6 +183,9 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
                 #[allow(clippy::cast_possible_truncation)]
                 let ts = if f < 100_000_000_000.0 {
                     (f * 1000.0).round() as i64
+                } else if (100_000_000_000_000.0..=100_000_000_000_000_000.0).contains(&f) {
+                    // Microsecond epoch (see the as_i64 branch above).
+                    (f / 1000.0).round() as i64
                 } else {
                     f.round() as i64
                 };
@@ -115,6 +197,9 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
         if let Ok(num) = s.parse::<i64>() {
             let ts = if (0..100_000_000_000).contains(&num) {
                 num.saturating_mul(1000)
+            } else if (100_000_000_000_000..=100_000_000_000_000_000).contains(&num) {
+                // Microsecond epoch (see the as_i64 branch above).
+                num / 1000
             } else {
                 num
             };
@@ -127,6 +212,9 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
             #[allow(clippy::cast_possible_truncation)]
             let ts = if (0.0..100_000_000_000.0).contains(&num) {
                 (num * 1000.0).round() as i64
+            } else if (100_000_000_000_000.0..=100_000_000_000_000_000.0).contains(&num) {
+                // Microsecond epoch (see the as_i64 branch above).
+                (num / 1000.0).round() as i64
             } else {
                 num.round() as i64
             };
@@ -212,7 +300,14 @@ fn extract_content_part(item: &serde_json::Value) -> Option<String> {
     let item_type = item.get("type").and_then(|v| v.as_str());
 
     if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-        if item_type.is_none() || item_type == Some("text") || item_type == Some("input_text") {
+        // `output_text` is the modern Codex/Responses-API assistant text block;
+        // `input_text` is the user/developer counterpart. Both, like a plain
+        // `text` block, carry rendered text we want to surface.
+        if item_type.is_none()
+            || item_type == Some("text")
+            || item_type == Some("input_text")
+            || item_type == Some("output_text")
+        {
             return Some(text.to_string());
         }
     }
@@ -338,6 +433,61 @@ mod tests {
     }
 
     #[test]
+    fn is_injected_context_message_detects_known_wrappers() {
+        assert!(is_injected_context_message(
+            "# AGENTS.md instructions for /data/projects/demo\nDo the thing"
+        ));
+        assert!(is_injected_context_message(
+            "<environment_context>macos</environment_context>"
+        ));
+        assert!(is_injected_context_message("<session_context>\n…"));
+        assert!(is_injected_context_message("  <user_instructions>…"));
+    }
+
+    #[test]
+    fn is_injected_context_message_allows_real_prompts() {
+        assert!(!is_injected_context_message("Fix the flaky test in it.rs"));
+        // Wrapper text appearing mid-message is not an injection header.
+        assert!(!is_injected_context_message(
+            "please read the <session_context> block"
+        ));
+    }
+
+    #[test]
+    fn read_capped_enforces_size_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let small = dir.path().join("small.txt");
+        std::fs::write(&small, "tiny").unwrap();
+        assert_eq!(read_capped(&small).unwrap().as_deref(), Some("tiny"));
+
+        // Sparse file: reports as over the cap without materializing 100MB.
+        let big = dir.path().join("big.txt");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(MAX_SCAN_FILE_BYTES + 1).unwrap();
+        drop(file);
+        assert!(read_capped(&big).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_timestamp_i64_microseconds() {
+        // 1_700_000_000_000_000 µs == 1_700_000_000_000 ms.
+        let val = json!(1_700_000_000_000_000_i64);
+        assert_eq!(parse_timestamp(&val), Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn parse_timestamp_float_microseconds() {
+        let val = json!(1_700_000_000_500_000.0_f64);
+        assert_eq!(parse_timestamp(&val), Some(1_700_000_000_500));
+    }
+
+    #[test]
+    fn parse_timestamp_numeric_string_microseconds() {
+        let val = json!("1700000000000000");
+        assert_eq!(parse_timestamp(&val), Some(1_700_000_000_000));
+    }
+
+    #[test]
     fn parse_timestamp_numeric_string_seconds() {
         let val = json!("1700000000");
         assert_eq!(parse_timestamp(&val), Some(1_700_000_000_000));
@@ -448,6 +598,13 @@ mod tests {
     fn flatten_content_input_text_block() {
         let val = json!([{"type": "input_text", "text": "Codex input"}]);
         assert_eq!(flatten_content(&val), "Codex input");
+    }
+
+    #[test]
+    fn flatten_content_output_text_block() {
+        // Modern Codex assistant messages encode text as `output_text` blocks.
+        let val = json!([{"type": "output_text", "text": "Codex assistant output"}]);
+        assert_eq!(flatten_content(&val), "Codex assistant output");
     }
 
     #[test]

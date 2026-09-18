@@ -32,8 +32,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
-use frankensqlite::{Connection, Row, SqliteValue, params};
+use rusqlite::types::Value as SqliteValue;
+use rusqlite::{Connection, OpenFlags, Row};
 use serde::Deserialize;
 use walkdir::WalkDir;
 
@@ -245,11 +245,13 @@ impl OpenCodeConnector {
             }
         }
 
-        db_candidates.extend(
-            Self::sqlite_db_candidates()
-                .into_iter()
-                .map(ScanRoot::local),
-        );
+        if ctx.data_dir.as_os_str().is_empty() && ctx.scan_roots.is_empty() {
+            db_candidates.extend(
+                Self::sqlite_db_candidates()
+                    .into_iter()
+                    .map(ScanRoot::local),
+            );
+        }
 
         let mut seen = HashSet::new();
         db_candidates.retain(|root| seen.insert(root.path.clone()));
@@ -261,7 +263,10 @@ impl OpenCodeConnector {
         if ctx.use_default_detection() {
             if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
                 storage_roots.push(ScanRoot::local(ctx.data_dir.clone()));
-            } else if let Some(root) = Self::storage_root() {
+            } else if ctx.data_dir.as_os_str().is_empty()
+                && ctx.scan_roots.is_empty()
+                && let Some(root) = Self::storage_root()
+            {
                 storage_roots.push(ScanRoot::local(root));
             }
         } else {
@@ -287,7 +292,21 @@ impl OpenCodeConnector {
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
         let mut out = Vec::new();
         Self::discover_sqlite_sources(ctx, &mut out);
-        Self::discover_legacy_storage_sources(ctx, &mut out);
+        // `opencode.db` is authoritative once it exists: opencode's v1.2
+        // migration imports the pre-v1.2 file storage
+        // (`storage/{session,message,part}`) into the database and then leaves
+        // those files untouched. When the DB is present the legacy tree is
+        // fully redundant — and on a migrated install it is hundreds of
+        // thousands of tiny per-part files. Enumerating them here makes the
+        // indexer capture each one into the raw mirror before the scan even
+        // starts, which stalls ingestion. Only fall back to discovering legacy
+        // sources on pre-v1.2 installs that never migrated (no DB present).
+        let has_sqlite_db = out
+            .iter()
+            .any(|source| source.role == DiscoveredSourceRole::SqliteDatabase);
+        if !has_sqlite_db {
+            Self::discover_legacy_storage_sources(ctx, &mut out);
+        }
         out
     }
 
@@ -435,56 +454,93 @@ impl OpenCodeConnector {
     ///
     /// Schema: session(id, title, directory, project_id, time_created, time_updated),
     ///         message(id, session_id, data JSON), part(id, message_id, session_id, data JSON)
+    /// Collect every conversation from an OpenCode SQLite DB into a Vec.
+    ///
+    /// Thin collector over the streaming core, retained for tests that assert on
+    /// the full result set. Production paths (`scan` / `scan_with_callback`) drive
+    /// `stream_from_sqlite` directly so peak memory tracks a single session rather
+    /// than the whole corpus.
+    #[cfg(test)]
     fn extract_from_sqlite(
         db_path: &Path,
         since_ts: Option<i64>,
     ) -> Result<Vec<NormalizedConversation>> {
-        let conn = open_with_flags(
-            db_path.to_string_lossy().as_ref(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("failed to open OpenCode db: {}", db_path.display()))?;
-
-        conn.execute("PRAGMA busy_timeout = 5000;")
-            .with_context(|| "failed to set busy_timeout")?;
-
-        // Query all sessions. Read timestamps as raw SQLite values — Drizzle ORM may
-        // store them as ISO text (YYYY-MM-DD HH:MM:SS) or epoch integers depending on config.
-        // We normalize in Rust rather than using strftime() which breaks on integer columns.
-        let sessions: Vec<SqliteSession> = conn
-            .query_map_collect(
-                "SELECT id, title, directory, project_id, time_created, time_updated FROM session",
-                params![],
-                |row| {
-                    Ok(SqliteSession {
-                        id: row.get_typed(0)?,
-                        title: row.get_typed(1)?,
-                        directory: row.get_typed(2)?,
-                        project_id: row.get_typed(3)?,
-                        time_created_raw: optional_sqlite_value(row, 4),
-                        time_updated_raw: optional_sqlite_value(row, 5),
-                    })
-                },
-            )
-            .with_context(|| "failed to query OpenCode sessions")?;
-
-        let mut messages_by_session = Self::load_sqlite_messages_by_session(&conn)?;
         let mut convs = Vec::new();
         let mut seen_ids = HashSet::new();
+        Self::stream_from_sqlite(db_path, since_ts, &mut seen_ids, &mut |conv| {
+            convs.push(conv);
+            Ok(())
+        })?;
+        Ok(convs)
+    }
+
+    /// Stream conversations from an OpenCode SQLite DB one session at a time.
+    ///
+    /// The `part` table on a real OpenCode DB is routinely multiple GB (tool
+    /// outputs, inlined base64 files). The previous implementation loaded the
+    /// entire `part` and `message` tables into memory before assembling anything,
+    /// so peak heap scaled with the whole corpus and OOM'd large DBs. Here we read
+    /// only the small `session` table up front, then load each session's messages
+    /// and parts scoped by `session_id` — both columns are indexed
+    /// (`part_session_idx`, `message_session_time_created_id_idx`) — emit the
+    /// conversation, and let it drop. Peak memory tracks the single largest
+    /// session, not the database.
+    fn stream_from_sqlite(
+        db_path: &Path,
+        since_ts: Option<i64>,
+        seen_ids: &mut HashSet<String>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("failed to open OpenCode db: {}", db_path.display()))?;
+
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .with_context(|| "failed to set busy_timeout")?;
+
+        // Read timestamps as raw SQLite values — Drizzle ORM may store them as ISO
+        // text (YYYY-MM-DD HH:MM:SS) or epoch integers; we normalize in Rust rather
+        // than using strftime() which breaks on integer columns.
+        let sessions: Vec<SqliteSession> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, title, directory, project_id, time_created, time_updated FROM session",
+                )
+                .with_context(|| "failed to prepare OpenCode sessions query")?;
+            stmt.query_map([], |row| {
+                Ok(SqliteSession {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    directory: row.get(2)?,
+                    project_id: row.get(3)?,
+                    time_created_raw: optional_sqlite_value(row, 4),
+                    time_updated_raw: optional_sqlite_value(row, 5),
+                })
+            })
+            .with_context(|| "failed to query OpenCode sessions")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .with_context(|| "failed to read OpenCode session rows")?
+        };
+
+        warn_on_opencode_schema_drift(&conn, db_path);
+
+        // Per-session statements, prepared once and reused. Both are scoped by
+        // session_id (indexed by message_session_time_created_id_idx and
+        // part_session_idx), so each fetches only one session's rows.
+        let mut msg_stmt = conn
+            .prepare(
+                "SELECT id, data, time_created FROM message
+                 WHERE session_id = ?1
+                 ORDER BY time_created ASC, id ASC",
+            )
+            .with_context(|| "failed to prepare OpenCode messages query")?;
+        // No ORDER BY: load_session_parts groups parts by message_id and
+        // sort_parts_for_message re-sorts each message's parts, so a SQL sort here
+        // would only build a per-session temp b-tree that is immediately discarded.
+        let mut part_stmt = conn
+            .prepare("SELECT message_id, data FROM part WHERE session_id = ?1")
+            .with_context(|| "failed to prepare OpenCode parts query")?;
 
         for session in sessions {
-            if !seen_ids.insert(session.id.clone()) {
-                continue;
-            }
-
-            let messages = messages_by_session.remove(&session.id).unwrap_or_default();
-            if messages.is_empty() {
-                continue;
-            }
-
-            let msg_started_at = messages.iter().filter_map(|m| m.created_at).min();
-            let msg_ended_at = messages.iter().filter_map(|m| m.created_at).max();
-
             let session_created_ms = session
                 .time_created_raw
                 .as_ref()
@@ -494,11 +550,43 @@ impl OpenCodeConnector {
                 .as_ref()
                 .and_then(normalize_sqlite_ts_value);
 
+            // Incremental fast-path: skip loading a session's messages/parts when
+            // its own update timestamp predates since_ts. Gate on session_updated_ms
+            // specifically (not created) — the post-load filter sets
+            // ended_at = session_updated_ms.or(msg_ended_at)..., so skipping only on
+            // session_updated_ms keeps this a strict subset of what the post-load
+            // filter rejects: we never drop a session it would have kept (e.g. one
+            // with no time_updated but newer messages).
+            if let Some(since) = since_ts
+                && let Some(updated) = session_updated_ms
+                && updated < since
+            {
+                continue;
+            }
+
+            // First occurrence of a session id wins (dedupes within and across DBs,
+            // and against the legacy JSON path that shares this set). Claimed only
+            // after the since fast-path, so a since-skipped session does not block
+            // the JSON fallback — matching the pre-rewrite dedup semantics.
+            if !seen_ids.insert(session.id.clone()) {
+                continue;
+            }
+
+            let parts_by_message = Self::load_session_parts(&mut part_stmt, &session.id)?;
+            let messages =
+                Self::load_session_messages(&mut msg_stmt, &session.id, parts_by_message)?;
+            if messages.is_empty() {
+                continue;
+            }
+
+            let msg_started_at = messages.iter().filter_map(|m| m.created_at).min();
+            let msg_ended_at = messages.iter().filter_map(|m| m.created_at).max();
+
             let started_at = session_created_ms.or(msg_started_at);
             let ended_at = session_updated_ms.or(msg_ended_at).or(started_at);
 
-            // Filter by since_ts in Rust (can't reliably filter in SQL when
-            // timestamp column format is unknown).
+            // Final since_ts filter, for sessions whose only timestamp came from
+            // their messages (no usable session timestamp for the fast-path above).
             if let Some(since) = since_ts {
                 let latest = ended_at.or(started_at).unwrap_or(0);
                 if latest < since {
@@ -514,7 +602,7 @@ impl OpenCodeConnector {
                     .map(|s| s.chars().take(100).collect())
             });
 
-            convs.push(NormalizedConversation {
+            on_conversation(NormalizedConversation {
                 agent_slug: "opencode".into(),
                 external_id: Some(session.id.clone()),
                 title,
@@ -528,124 +616,107 @@ impl OpenCodeConnector {
                     "source": "sqlite",
                 }),
                 messages,
-            });
+                ..Default::default()
+            })?;
         }
 
-        Ok(convs)
+        Ok(())
     }
 
-    fn load_sqlite_messages_by_session(
-        conn: &Connection,
-    ) -> Result<HashMap<String, Vec<NormalizedMessage>>> {
-        let mut parts_by_message = Self::load_sqlite_parts_by_message(conn)?;
-        let rows: Vec<SqliteMessageRow> = conn.query_map_collect(
-            "SELECT session_id, id, data, time_created
-             FROM message
-             ORDER BY session_id ASC, time_created ASC, id ASC",
-            params![],
-            |row| {
-                Ok(SqliteMessageRow {
-                    session_id: row.get_typed(0)?,
-                    id: row.get_typed(1)?,
-                    data_json: row.get_typed(2)?,
-                    time_created_raw: optional_sqlite_value(row, 3),
-                })
-            },
-        )?;
+    /// Load one session's messages (scoped by `session_id`), draining its parts
+    /// from `parts_by_message` and assembling per-message content.
+    fn load_session_messages(
+        stmt: &mut rusqlite::Statement<'_>,
+        session_id: &str,
+        mut parts_by_message: HashMap<String, Vec<PartInfo>>,
+    ) -> Result<Vec<NormalizedMessage>> {
+        let mut pending: Vec<PendingSqliteMessage> = Vec::new();
+        let mut rows = stmt
+            .query([session_id])
+            .with_context(|| "failed to query OpenCode messages")?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let data_json: String = row.get(1)?;
+            let time_created_raw = optional_sqlite_value(row, 2);
 
-        let mut pending_by_session: HashMap<String, Vec<PendingSqliteMessage>> = HashMap::new();
-
-        for row in rows {
-            let msg_data: SqliteMessageData = match serde_json::from_str(&row.data_json) {
+            let msg_data: SqliteMessageData = match serde_json::from_str(&data_json) {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::debug!(
-                        "opencode sqlite: failed to parse message data for {}: {e}",
-                        row.id
-                    );
+                    tracing::debug!("opencode sqlite: failed to parse message data for {id}: {e}");
                     continue;
                 }
             };
 
-            let parts = parts_by_message.remove(&row.id).unwrap_or_default();
-            let content_text = if !parts.is_empty() {
-                assemble_content_from_parts(&parts)
-            } else {
+            let parts = parts_by_message.remove(&id).unwrap_or_default();
+            let content_text = if parts.is_empty() {
                 String::new()
+            } else {
+                assemble_content_from_parts(&parts)
             };
-
             if content_text.trim().is_empty() {
                 continue;
             }
 
             let role = msg_data.role.unwrap_or_else(|| "assistant".to_string());
-            let col_ts = row
-                .time_created_raw
+            let col_ts = time_created_raw
                 .as_ref()
                 .and_then(normalize_sqlite_ts_value);
             let created_at =
                 normalize_opencode_timestamp(msg_data.time.as_ref().and_then(|t| t.created))
                     .or(col_ts);
-
             let author = if role == "assistant" {
                 msg_data.model_id.clone()
             } else {
                 Some("user".to_string())
             };
 
-            let message_id = row.id;
-            let session_id = row.session_id;
-            pending_by_session
-                .entry(session_id.clone())
-                .or_default()
-                .push(PendingSqliteMessage {
+            pending.push(PendingSqliteMessage {
+                created_at,
+                message_id: id.clone(),
+                message: NormalizedMessage {
+                    idx: 0,
+                    role,
+                    author,
                     created_at,
-                    message_id: message_id.clone(),
-                    message: NormalizedMessage {
-                        idx: 0,
-                        role,
-                        author,
-                        created_at,
-                        content: content_text,
-                        extra: serde_json::json!({
-                            "message_id": message_id,
-                            "session_id": session_id,
-                        }),
-                        invocations: Vec::new(),
-                        snippets: Vec::new(),
-                    },
-                });
-        }
-
-        let mut messages_by_session = HashMap::new();
-        for (session_id, mut pending) in pending_by_session {
-            pending.sort_by(|a, b| {
-                let a_ts = a.created_at.unwrap_or(i64::MAX);
-                let b_ts = b.created_at.unwrap_or(i64::MAX);
-                a_ts.cmp(&b_ts)
-                    .then_with(|| a.message_id.cmp(&b.message_id))
+                    content: content_text,
+                    extra: serde_json::json!({
+                        "message_id": id,
+                        "session_id": session_id,
+                    }),
+                    invocations: Vec::new(),
+                    snippets: Vec::new(),
+                    ..Default::default()
+                },
             });
-            let mut messages: Vec<NormalizedMessage> =
-                pending.into_iter().map(|pending| pending.message).collect();
-            crate::types::reindex_messages(&mut messages);
-            messages_by_session.insert(session_id, messages);
         }
 
-        Ok(messages_by_session)
+        pending.sort_by(|a, b| {
+            let a_ts = a.created_at.unwrap_or(i64::MAX);
+            let b_ts = b.created_at.unwrap_or(i64::MAX);
+            a_ts.cmp(&b_ts)
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        let mut messages: Vec<NormalizedMessage> =
+            pending.into_iter().map(|pending| pending.message).collect();
+        crate::types::reindex_messages(&mut messages);
+        Ok(messages)
     }
 
-    fn load_sqlite_parts_by_message(conn: &Connection) -> Result<HashMap<String, Vec<PartInfo>>> {
-        let rows: Vec<(String, String)> = conn.query_map_collect(
-            "SELECT message_id, data
-             FROM part
-             ORDER BY message_id ASC, time_created ASC, id ASC",
-            params![],
-            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-        )?;
-
+    /// Load one session's parts (scoped by `session_id`), grouped by message id.
+    /// Each row's raw `data` string is transient — `SqlitePartData` ignores the
+    /// `file` part's base64 `url`, so inlined images are not retained in memory.
+    fn load_session_parts(
+        stmt: &mut rusqlite::Statement<'_>,
+        session_id: &str,
+    ) -> Result<HashMap<String, Vec<PartInfo>>> {
         let mut parts_by_message: HashMap<String, Vec<PartInfo>> = HashMap::new();
-        for (message_id, row) in rows {
-            match serde_json::from_str::<SqlitePartData>(&row) {
+        let mut rows = stmt
+            .query([session_id])
+            .with_context(|| "failed to query OpenCode parts")?;
+        while let Some(row) = rows.next()? {
+            let message_id: String = row.get(0)?;
+            let data: String = row.get(1)?;
+            match serde_json::from_str::<SqlitePartData>(&data) {
                 Ok(part_data) => {
                     parts_by_message
                         .entry(message_id)
@@ -671,13 +742,6 @@ impl OpenCodeConnector {
 
         Ok(parts_by_message)
     }
-}
-
-struct SqliteMessageRow {
-    session_id: String,
-    id: String,
-    data_json: String,
-    time_created_raw: Option<SqliteValue>,
 }
 
 struct PendingSqliteMessage {
@@ -804,9 +868,35 @@ impl Connector for OpenCodeConnector {
         franken_detection_for_connector("opencode").unwrap_or_else(DetectionResult::not_found)
     }
 
+    fn supports_streaming_scan(&self) -> bool {
+        true
+    }
+
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut convs = Vec::new();
+        self.scan_with_callback(ctx, &mut |conv| {
+            convs.push(conv);
+            Ok(())
+        })?;
+        Ok(convs)
+    }
+
+    fn scan_with_callback(
+        &self,
+        ctx: &ScanContext,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        // Shared across the SQLite stream and the legacy JSON fallback so a
+        // session present in both sources is emitted only once (first wins).
+        let mut seen_ids: HashSet<String> = HashSet::new();
         let mut scanned_dbs: HashSet<PathBuf> = HashSet::new();
+        // Whether at least one SQLite database was read successfully. This — not
+        // `seen_ids` — gates the legacy fallback: an incremental scan can read
+        // the DB cleanly yet emit nothing (every session predates `since_ts`),
+        // which would leave `seen_ids` empty and wrongly re-trigger the legacy
+        // walk. A DB that opened OK is authoritative regardless of how many
+        // sessions matched; a DB that failed to open still falls back to legacy.
+        let mut db_scanned_ok = false;
 
         // --- Phase 1: Try SQLite database(s) (v1.2+) ---
         // Collect candidate database paths in priority order:
@@ -837,7 +927,12 @@ impl Connector for OpenCodeConnector {
             }
         }
 
-        db_candidates.extend(Self::sqlite_db_candidates());
+        // A non-empty explicit data directory is already a hermetic source
+        // boundary (and is how connector tests provide fixtures). Only probe
+        // the host's default locations for the empty/default context.
+        if ctx.data_dir.as_os_str().is_empty() && ctx.scan_roots.is_empty() {
+            db_candidates.extend(Self::sqlite_db_candidates());
+        }
 
         // Deduplicate while preserving priority order.
         {
@@ -855,31 +950,56 @@ impl Connector for OpenCodeConnector {
             if !scanned_dbs.insert(canonical) {
                 continue;
             }
-            match Self::extract_from_sqlite(&db, ctx.since_ts) {
-                Ok(sqlite_convs) => {
-                    tracing::debug!(
-                        "opencode sqlite: found {} sessions in {}",
-                        sqlite_convs.len(),
-                        db.display()
-                    );
-                    convs.extend(sqlite_convs);
-                }
+            // Stream this DB's sessions straight to the callback. A broken DB
+            // (open/prepare/query failure) is logged and skipped — not fatal,
+            // matching the prior per-candidate handling. But a callback error
+            // (the orchestrator failing to ingest a conversation) must PROPAGATE,
+            // not be swallowed by that DB-error skip — capture it separately so we
+            // can return it instead of reporting a false success. seen_ids is
+            // updated as sessions are emitted.
+            let mut callback_error: Option<anyhow::Error> = None;
+            let stream_result =
+                Self::stream_from_sqlite(&db, ctx.since_ts, &mut seen_ids, &mut |conv| {
+                    on_conversation(conv).map_err(|err| {
+                        callback_error = Some(err);
+                        anyhow::anyhow!("opencode: conversation callback failed")
+                    })
+                });
+            if let Some(err) = callback_error {
+                return Err(err);
+            }
+            match stream_result {
+                Ok(()) => db_scanned_ok = true,
                 Err(e) => {
                     tracing::debug!("opencode sqlite: failed to read {}: {e}", db.display());
                 }
             }
         }
 
-        // Collect seen IDs from SQLite results to avoid duplicates with JSON
-        let mut seen_ids: HashSet<String> =
-            convs.iter().filter_map(|c| c.external_id.clone()).collect();
-
         // --- Phase 2: Fall back to JSON file storage (pre-v1.2) ---
+        //
+        // The SQLite database is authoritative once it has been read: opencode's
+        // v1.2 migration imports the legacy file storage into the DB and stops
+        // writing the files, so a readable DB already contains every legacy
+        // session (the dedup set would drop them all anyway). Skipping the
+        // fallback avoids re-walking and re-parsing the migrated tree, which on a
+        // real install is 100k+ message + part files. Gate on `db_scanned_ok`,
+        // not on whether any session was emitted: an incremental scan can read
+        // the DB cleanly yet match zero sessions (all predate `since_ts`), and
+        // that must still skip the legacy walk. Only installs with no readable
+        // DB (pre-v1.2, or a corrupt DB) fall through to the file scan.
+        if db_scanned_ok {
+            return Ok(());
+        }
+
         let mut storage_roots: Vec<PathBuf> = Vec::new();
         if ctx.use_default_detection() {
             if ctx.data_dir.exists() && looks_like_opencode_storage(&ctx.data_dir) {
                 storage_roots.push(ctx.data_dir.clone());
-            } else if let Some(root) = Self::storage_root() {
+            } else if ctx.data_dir.as_os_str().is_empty()
+                && ctx.scan_roots.is_empty()
+                && let Some(root) = Self::storage_root()
+            {
                 storage_roots.push(root);
             }
         } else {
@@ -898,7 +1018,7 @@ impl Connector for OpenCodeConnector {
         }
 
         if storage_roots.is_empty() {
-            return Ok(convs);
+            return Ok(());
         }
 
         storage_roots.sort();
@@ -990,7 +1110,7 @@ impl Connector for OpenCodeConnector {
                         .map(|s| s.chars().take(100).collect())
                 });
 
-                convs.push(NormalizedConversation {
+                on_conversation(NormalizedConversation {
                     agent_slug: "opencode".into(),
                     external_id: Some(session.id.clone()),
                     title,
@@ -1003,11 +1123,12 @@ impl Connector for OpenCodeConnector {
                         "project_id": session.project_id,
                     }),
                     messages,
-                });
+                    ..Default::default()
+                })?;
             }
         }
 
-        Ok(convs)
+        Ok(())
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
@@ -1024,6 +1145,47 @@ fn looks_like_opencode_storage(path: &std::path::Path) -> bool {
     path.join("session").exists() && path.join("message").exists()
 }
 
+/// The closed set of tables the schema-drift guard probes. Keeping it an enum
+/// means the count query below is built from a compile-time string literal — the
+/// table name is never interpolated from a caller-supplied string.
+#[derive(Clone, Copy)]
+enum OpenCodeRowCount {
+    Message,
+    SessionMessage,
+}
+
+/// Count rows in one of the known OpenCode tables, returning `None` when the
+/// table does not exist (the query errors, which `.ok()` maps to `None`).
+fn count_known_table_rows(conn: &Connection, table: OpenCodeRowCount) -> Option<i64> {
+    let count_sql = match table {
+        OpenCodeRowCount::Message => "SELECT count(*) FROM message",
+        OpenCodeRowCount::SessionMessage => "SELECT count(*) FROM session_message",
+    };
+    conn.query_row(count_sql, [], |r| r.get(0)).ok()
+}
+
+/// Warn loudly when the `message`/`part` tables this connector reads are empty
+/// but the newer `session_message` table is populated — i.e. OpenCode migrated
+/// to a schema this connector does not yet read. Without this, the scan would
+/// silently return zero conversations and look like a successful no-op.
+fn warn_on_opencode_schema_drift(conn: &Connection, db_path: &Path) {
+    if count_known_table_rows(conn, OpenCodeRowCount::Message).unwrap_or(0) != 0 {
+        return;
+    }
+    if let Some(session_message_rows) =
+        count_known_table_rows(conn, OpenCodeRowCount::SessionMessage)
+        && session_message_rows > 0
+    {
+        tracing::warn!(
+            db = %db_path.display(),
+            session_message_rows,
+            "opencode: `message` table is empty but `session_message` has rows; OpenCode \
+             may have migrated to a schema this connector does not read — indexing 0 \
+             OpenCode conversations from this database"
+        );
+    }
+}
+
 fn normalize_opencode_timestamp(ts: Option<i64>) -> Option<i64> {
     ts.map(|raw| {
         // OpenCode appears to store epoch timestamps in milliseconds (see fixtures),
@@ -1038,13 +1200,10 @@ fn normalize_opencode_timestamp(ts: Option<i64>) -> Option<i64> {
 }
 
 fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
-    row.get(index).and_then(|value| {
-        if matches!(value, SqliteValue::Null) {
-            None
-        } else {
-            Some(value.clone())
-        }
-    })
+    match row.get::<_, SqliteValue>(index) {
+        Ok(SqliteValue::Null) | Err(_) => None,
+        Ok(value) => Some(value),
+    }
 }
 
 /// Normalize a raw SQLite value to epoch milliseconds.
@@ -1057,7 +1216,7 @@ fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
 fn normalize_sqlite_ts_value(val: &SqliteValue) -> Option<i64> {
     match val {
         SqliteValue::Integer(i) => normalize_opencode_timestamp(Some(*i)),
-        SqliteValue::Float(f) => normalize_opencode_timestamp(Some(*f as i64)),
+        SqliteValue::Real(f) => normalize_opencode_timestamp(Some(*f as i64)),
         SqliteValue::Text(s) => {
             // Try common SQLite/Drizzle datetime formats (space separator)
             if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
@@ -1254,6 +1413,7 @@ fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<Normaliz
                 }),
                 invocations: Vec::new(),
                 snippets: Vec::new(),
+                ..Default::default()
             },
         ));
     }
@@ -1296,45 +1456,87 @@ fn sort_parts_for_message(parts: &mut [PartInfo]) {
     });
 }
 
-/// Assemble message content from parts
+/// Cap on a single part's contributed text. OpenCode tool outputs can reach
+/// multiple MB (whole-file dumps, command spew); the head carries the search
+/// signal, so we keep the head and mark the truncated tail.
+const MAX_PART_CONTENT_BYTES: usize = 256 * 1024;
+/// Cap on a single message's total assembled content. A pathological session can
+/// hold a 100+ MB message; bound it so neither the heap nor the lexical indexer
+/// chokes on one document.
+const MAX_MESSAGE_CONTENT_BYTES: usize = 1024 * 1024;
+
+/// Truncate `s` to at most `max_bytes`, snapping down to a UTF-8 char boundary.
+/// Returns the (possibly shortened) slice and whether truncation occurred.
+fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
+    if s.len() <= max_bytes {
+        return (s, false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&s[..end], true)
+}
+
+/// Cap a single part's body, appending a byte-count marker when truncated.
+fn cap_part_body(body: &str) -> String {
+    let (head, truncated) = truncate_on_char_boundary(body, MAX_PART_CONTENT_BYTES);
+    if truncated {
+        format!("{head}\n[… truncated {} bytes]", body.len() - head.len())
+    } else {
+        head.to_string()
+    }
+}
+
+/// Assemble message content from parts.
+///
+/// Each part's body is capped at `MAX_PART_CONTENT_BYTES`. The assembled message
+/// is bounded by `MAX_MESSAGE_CONTENT_BYTES` as a SOFT cap: the check fires before
+/// appending each piece, so the piece that crosses the threshold is still added —
+/// the true upper bound is `MAX_MESSAGE_CONTENT_BYTES + MAX_PART_CONTENT_BYTES`
+/// (~1.25 MiB) plus the truncation marker. That keeps one giant tool output (or a
+/// session with thousands of large parts) from ballooning a single message's
+/// content. Output is byte-identical to the uncapped path for content under the caps.
 fn assemble_content_from_parts(parts: &[PartInfo]) -> String {
     let mut content_pieces: Vec<String> = Vec::new();
+    let mut total_bytes = 0usize;
 
     for part in parts {
-        match part.part_type.as_deref() {
-            Some("text") => {
-                if let Some(text) = &part.text
-                    && !text.trim().is_empty()
-                {
-                    content_pieces.push(text.clone());
-                }
-            }
-            Some("tool") => {
-                // Include tool output if available
-                if let Some(state) = &part.state
-                    && let Some(output) = &state.output
-                    && !output.trim().is_empty()
-                {
-                    content_pieces.push(format!("[Tool Output]\n{}", output));
-                }
-            }
-            Some("reasoning") => {
-                if let Some(text) = &part.text
-                    && !text.trim().is_empty()
-                {
-                    content_pieces.push(format!("[Reasoning]\n{}", text));
-                }
-            }
-            Some("patch") => {
-                if let Some(text) = &part.text
-                    && !text.trim().is_empty()
-                {
-                    content_pieces.push(format!("[Patch]\n{}", text));
-                }
-            }
-            // Ignore step-start, step-finish, and other control parts
-            _ => {}
+        let piece = match part.part_type.as_deref() {
+            Some("text") => part
+                .text
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+                .map(cap_part_body),
+            Some("tool") => part
+                .state
+                .as_ref()
+                .and_then(|s| s.output.as_deref())
+                .filter(|o| !o.trim().is_empty())
+                .map(|o| format!("[Tool Output]\n{}", cap_part_body(o))),
+            Some("reasoning") => part
+                .text
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| format!("[Reasoning]\n{}", cap_part_body(t))),
+            Some("patch") => part
+                .text
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| format!("[Patch]\n{}", cap_part_body(t))),
+            // Ignore step-start, step-finish, and other control parts.
+            _ => None,
+        };
+        // Only real (non-empty) pieces count toward the cap and trigger the
+        // truncation marker — control/empty parts after the cap is crossed must
+        // not produce a spurious marker for content that was never dropped.
+        let Some(piece) = piece else { continue };
+        if total_bytes >= MAX_MESSAGE_CONTENT_BYTES {
+            content_pieces.push("[… message content truncated]".to_string());
+            break;
         }
+        total_bytes += piece.len() + 2; // + "\n\n" separator
+        content_pieces.push(piece);
     }
 
     content_pieces.join("\n\n")
@@ -1343,13 +1545,14 @@ fn assemble_content_from_parts(parts: &[PartInfo]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
     use serde_json::json;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
 
     fn open_test_connection(path: &Path) -> Connection {
-        Connection::open(path.to_string_lossy().as_ref()).unwrap()
+        Connection::open(path).unwrap()
     }
 
     // =====================================================
@@ -2586,7 +2789,23 @@ mod tests {
         let ctx = ScanContext::local_default(storage.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
-        assert!(convs[0].messages[0].content.len() >= 1_000_000);
+        // A 1 MB part is now capped at MAX_PART_CONTENT_BYTES with a truncation
+        // marker rather than retained verbatim — this bounds message content from
+        // monster tool outputs / inlined files. The head is preserved for search.
+        let content = &convs[0].messages[0].content;
+        assert!(
+            content.len() < 1_000_000,
+            "oversized part must be capped, got {} bytes",
+            content.len()
+        );
+        assert!(
+            content.contains("[… truncated"),
+            "capped part must carry the truncation marker"
+        );
+        assert!(
+            content.contains(&"x".repeat(1000)),
+            "head must be preserved"
+        );
     }
 
     #[test]
@@ -2942,13 +3161,13 @@ mod tests {
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
             params!["sess-1", "proj-1", "Test Session", "/home/user/project"],
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params![
                 "msg-1",
@@ -2958,7 +3177,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "part-1",
@@ -2969,7 +3188,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params![
                 "msg-2",
@@ -2979,7 +3198,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "part-2",
@@ -3019,7 +3238,7 @@ mod tests {
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, title) VALUES (?1, ?2)",
             params!["sess-empty", "Empty Session"],
         )
@@ -3038,20 +3257,20 @@ mod tests {
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, title) VALUES (?1, ?2)",
             params!["sess-tools", "Tool Session"],
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params!["msg-t1", "sess-tools", r#"{"role":"assistant"}"#],
         )
         .unwrap();
 
         // Text part
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "p1",
@@ -3063,7 +3282,7 @@ mod tests {
         .unwrap();
 
         // Tool part with output
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "p2",
@@ -3091,17 +3310,17 @@ mod tests {
 
         // Two sessions with different IDs
         for (sid, title) in &[("sess-a", "Session A"), ("sess-b", "Session B")] {
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO session (id, title) VALUES (?1, ?2)",
                 params![*sid, *title],
             )
             .unwrap();
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
                 params![format!("msg-{sid}"), *sid, r#"{"role":"user"}"#],
             )
             .unwrap();
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     format!("p-{sid}"),
@@ -3126,7 +3345,7 @@ mod tests {
         let conn = open_test_connection(&db_path);
 
         for session_id in ["sess-a", "sess-b"] {
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO session (id, title) VALUES (?1, ?2)",
                 params![session_id, format!("Session {session_id}")],
             )
@@ -3138,7 +3357,7 @@ mod tests {
             ("msg-b-only", "sess-b", "user", 20_i64),
             ("msg-a-early", "sess-a", "user", 10_i64),
         ] {
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO message (id, session_id, data, time_created)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
@@ -3149,7 +3368,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO part (id, message_id, session_id, data, time_created)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
@@ -3224,18 +3443,18 @@ mod tests {
         .unwrap();
 
         // Insert session with epoch second timestamps
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, project_id, title, time_created, time_updated) VALUES (?1, ?2, ?3, ?4, ?5)",
             params!["sess-int", "proj-1", "Integer TS Session", 1700000000_i64, 1700000100_i64],
         ).unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data, time_created) VALUES (?1, ?2, ?3, ?4)",
             params!["msg-int", "sess-int", r#"{"role":"user"}"#, 1700000050_i64],
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "part-int",
@@ -3262,17 +3481,17 @@ mod tests {
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, project_id, title) VALUES (?1, ?2, ?3)",
             params!["sess-meta", "proj-meta", "Meta Session"],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params!["msg-meta", "sess-meta", r#"{"role":"user"}"#],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "p-meta",
@@ -3378,7 +3597,7 @@ mod tests {
 
     #[test]
     fn normalize_sqlite_ts_value_real() {
-        let val = SqliteValue::Float(1_700_000_000.5);
+        let val = SqliteValue::Real(1_700_000_000.5);
         assert_eq!(normalize_sqlite_ts_value(&val), Some(1_700_000_000_000));
     }
 
@@ -3451,7 +3670,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "sess-parent",
@@ -3461,7 +3680,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params![
                 "msg-parent",
@@ -3470,7 +3689,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "part-parent",
@@ -3500,7 +3719,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "sess-roots",
@@ -3510,7 +3729,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params![
                 "msg-roots",
@@ -3519,7 +3738,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "part-roots",
@@ -3556,7 +3775,7 @@ mod tests {
 
         let db_path = create_test_sqlite_db(&opencode_dir);
         let conn = open_test_connection(&db_path);
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "sess-config",
@@ -3566,7 +3785,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params![
                 "msg-config",
@@ -3575,7 +3794,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "part-config",
@@ -3607,7 +3826,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = create_test_sqlite_db(dir.path());
         let conn = open_test_connection(&db_path);
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "sess-direct",
@@ -3617,7 +3836,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
             params![
                 "msg-direct",
@@ -3626,7 +3845,7 @@ mod tests {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
             params![
                 "part-direct",
@@ -3667,6 +3886,382 @@ mod tests {
         assert!(
             convs.is_empty(),
             "nonexistent .db path should not produce sessions"
+        );
+    }
+
+    #[test]
+    fn assemble_caps_oversized_single_part() {
+        let big = "x".repeat(MAX_PART_CONTENT_BYTES + 50_000);
+        let parts = vec![PartInfo {
+            id: Some("p1".into()),
+            index: None,
+            message_id: Some("m1".into()),
+            part_type: Some("tool".into()),
+            text: None,
+            state: Some(ToolState {
+                output: Some(big.clone()),
+            }),
+        }];
+        let content = assemble_content_from_parts(&parts);
+        assert!(
+            content.len() < big.len(),
+            "oversized tool output must be truncated"
+        );
+        assert!(content.contains("[Tool Output]"));
+        assert!(
+            content.contains("[… truncated"),
+            "a truncated part must carry the byte-count marker"
+        );
+        assert!(
+            content.contains(&"x".repeat(1000)),
+            "the head of the output must be preserved"
+        );
+    }
+
+    #[test]
+    fn assemble_caps_total_message_content() {
+        // Ten ~200 KB text parts sum to ~2 MB, exceeding the 1 MB per-message cap.
+        let chunk = "y".repeat(200 * 1024);
+        let parts: Vec<PartInfo> = (0..10)
+            .map(|i| PartInfo {
+                id: Some(format!("p{i}")),
+                index: Some(i),
+                message_id: Some("m1".into()),
+                part_type: Some("text".into()),
+                text: Some(chunk.clone()),
+                state: None,
+            })
+            .collect();
+        let content = assemble_content_from_parts(&parts);
+        assert!(
+            content.contains("[… message content truncated]"),
+            "an assembled message exceeding the cap must be marked truncated"
+        );
+        assert!(
+            content.len() <= MAX_MESSAGE_CONTENT_BYTES + MAX_PART_CONTENT_BYTES + 1024,
+            "assembled content must stay bounded, got {}",
+            content.len()
+        );
+    }
+
+    #[test]
+    fn assemble_no_stray_marker_when_only_noop_parts_follow_cap() {
+        // Four 256 KiB text parts cross the 1 MiB per-message cap; a trailing
+        // control part (step-finish) contributes nothing. The marker must NOT
+        // appear — no real content was dropped after the last real part.
+        let chunk = "z".repeat(MAX_PART_CONTENT_BYTES);
+        let mut parts: Vec<PartInfo> = (0..4)
+            .map(|i| PartInfo {
+                id: Some(format!("p{i}")),
+                index: Some(i),
+                message_id: None,
+                part_type: Some("text".into()),
+                text: Some(chunk.clone()),
+                state: None,
+            })
+            .collect();
+        parts.push(PartInfo {
+            id: Some("pf".into()),
+            index: Some(99),
+            message_id: None,
+            part_type: Some("step-finish".into()),
+            text: None,
+            state: None,
+        });
+        let content = assemble_content_from_parts(&parts);
+        assert!(
+            !content.contains("message content truncated"),
+            "a trailing no-op part must not produce a stray truncation marker"
+        );
+
+        // Sanity: a trailing REAL part that IS dropped does produce the marker.
+        let mut with_real = parts;
+        with_real.pop(); // remove the step-finish
+        with_real.push(PartInfo {
+            id: Some("p5".into()),
+            index: Some(5),
+            message_id: None,
+            part_type: Some("text".into()),
+            text: Some(chunk.clone()),
+            state: None,
+        });
+        assert!(
+            assemble_content_from_parts(&with_real).contains("message content truncated"),
+            "a real part dropped past the cap must produce the truncation marker"
+        );
+    }
+
+    #[test]
+    fn supports_streaming_scan_is_true() {
+        assert!(OpenCodeConnector::new().supports_streaming_scan());
+    }
+
+    #[test]
+    fn stream_from_sqlite_emits_each_session_once() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        for s in ["sess-a", "sess-b"] {
+            conn.execute(
+                "INSERT INTO session (id, title) VALUES (?1, ?2)",
+                params![s, format!("Session {s}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+                params![
+                    format!("msg-{s}"),
+                    s,
+                    r#"{"role":"user","time":{"created":1700000000000}}"#
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    format!("part-{s}"),
+                    format!("msg-{s}"),
+                    s,
+                    r#"{"type":"text","text":"hello"}"#
+                ],
+            )
+            .unwrap();
+        }
+
+        // Drive the streaming core directly on this fixture DB. This bypasses
+        // scan()'s candidate expansion, so a real opencode.db on the host can't
+        // leak extra sessions into the assertion.
+        let mut seen = std::collections::HashSet::new();
+        let mut streamed: Vec<String> = Vec::new();
+        OpenCodeConnector::stream_from_sqlite(&db_path, None, &mut seen, &mut |c| {
+            if let Some(id) = c.external_id {
+                streamed.push(id);
+            }
+            Ok(())
+        })
+        .unwrap();
+        streamed.sort();
+        assert_eq!(
+            streamed,
+            vec!["sess-a".to_string(), "sess-b".to_string()],
+            "streaming must emit each session exactly once"
+        );
+
+        // The collector wrapper returns the same set of sessions.
+        let collected: std::collections::HashSet<String> =
+            OpenCodeConnector::extract_from_sqlite(&db_path, None)
+                .unwrap()
+                .into_iter()
+                .filter_map(|c| c.external_id)
+                .collect();
+        assert_eq!(
+            collected,
+            streamed
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            "extract_from_sqlite must collect the same sessions stream_from_sqlite emits"
+        );
+    }
+
+    #[test]
+    fn scan_warns_and_returns_empty_when_only_session_message_populated() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        // A session exists, but content lives only in the newer `session_message`
+        // table this connector does not read; `message`/`part` are empty.
+        conn.execute(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["sess-1", "Drifted"],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                data TEXT NOT NULL,
+                seq INTEGER NOT NULL
+            );
+            INSERT INTO session_message (id, session_id, type, data, seq)
+                VALUES ('sm-1', 'sess-1', 'text', '{\"text\":\"hi\"}', 0);",
+        )
+        .unwrap();
+
+        // Must not panic; returns empty because the readable tables are empty.
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        assert!(
+            convs.is_empty(),
+            "no readable message/part rows -> zero conversations (drift guard warns)"
+        );
+    }
+
+    /// Once `opencode.db` exists it is authoritative: opencode's v1.2 migration
+    /// imports the pre-v1.2 file storage into the DB and stops writing the
+    /// files. So when both are present in the same root, the connector must
+    /// ignore the legacy tree — both for raw-mirror source discovery (otherwise
+    /// it captures the migrated install's 100k+ per-part files one-by-one and
+    /// stalls the indexer) and for scanning (otherwise it re-reads them only to
+    /// dedup them away).
+    #[test]
+    fn db_present_supersedes_legacy_file_storage() {
+        let dir = TempDir::new().unwrap();
+
+        // (1) A populated SQLite DB at <dir>/opencode.db.
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute(
+            "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
+            params!["sess-db", "proj-db", "DB Session", "/home/user/db"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params![
+                "msg-db",
+                "sess-db",
+                r#"{"role":"user","time":{"created":1700000000000}}"#
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "part-db",
+                "msg-db",
+                "sess-db",
+                r#"{"type":"text","text":"From DB"}"#
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        // (2) Legacy file storage in the SAME root, holding a session that only
+        //     exists on disk (un-pruned pre-migration leftover).
+        write_session(
+            dir.path(),
+            "proj-legacy",
+            &json!({"id": "sess-legacy", "title": "Legacy", "projectID": "proj-legacy"}),
+        );
+        write_message(
+            dir.path(),
+            "sess-legacy",
+            &json!({"id": "msg-legacy", "role": "user", "sessionID": "sess-legacy", "time": {"created": 1700000000}}),
+        );
+        write_part(
+            dir.path(),
+            "msg-legacy",
+            &json!({"id": "p-legacy", "messageID": "msg-legacy", "type": "text", "text": "From legacy file"}),
+        );
+
+        let connector = OpenCodeConnector::new();
+        let ctx = ScanContext::local_default(dir.path().to_path_buf(), None);
+
+        // Raw-mirror source discovery: only the DB, never the legacy files.
+        let sources = connector.discover_source_files(&ctx).unwrap();
+        assert!(
+            sources
+                .iter()
+                .any(|s| s.role == DiscoveredSourceRole::SqliteDatabase),
+            "the SQLite database must still be discovered"
+        );
+        assert!(
+            !sources.iter().any(|s| matches!(
+                s.role,
+                DiscoveredSourceRole::PrimarySessionLog | DiscoveredSourceRole::MetadataSidecar
+            )),
+            "legacy file sources must not be discovered when opencode.db is present: {:?}",
+            sources.iter().map(|s| s.role).collect::<Vec<_>>()
+        );
+
+        // Scan: the DB is authoritative, so the legacy-only session is not
+        // re-indexed from files.
+        let convs = connector.scan(&ctx).unwrap();
+        let ids: Vec<&str> = convs
+            .iter()
+            .filter_map(|c| c.external_id.as_deref())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["sess-db"],
+            "only the DB session should be scanned"
+        );
+    }
+
+    /// Incremental edge case: the DB is read cleanly but `since_ts` filters out
+    /// every session (none updated recently), so no session is emitted. The
+    /// legacy fallback must STILL be skipped — gating on "a session was emitted"
+    /// would wrongly re-run the 100k+ file walk on every quiet incremental.
+    #[test]
+    fn db_supersedes_legacy_on_incremental_with_no_matching_db_sessions() {
+        let dir = TempDir::new().unwrap();
+
+        // DB session whose update timestamp is old (well before the since_ts below).
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        conn.execute(
+            "INSERT INTO session (id, project_id, title, directory, time_updated) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "sess-db-old",
+                "proj-db",
+                "Old DB Session",
+                "/home/user/db",
+                "2020-01-01 00:00:00"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params![
+                "msg-db",
+                "sess-db-old",
+                r#"{"role":"user","time":{"created":1577836800000}}"#
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "part-db",
+                "msg-db",
+                "sess-db-old",
+                r#"{"type":"text","text":"old"}"#
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Legacy file storage in the same root, written now (fresh mtime), so it
+        // WOULD pass session_has_updates and be scanned if the fallback ran.
+        write_session(
+            dir.path(),
+            "proj-legacy",
+            &json!({"id": "sess-legacy", "title": "Legacy", "projectID": "proj-legacy"}),
+        );
+        write_message(
+            dir.path(),
+            "sess-legacy",
+            &json!({"id": "msg-legacy", "role": "user", "sessionID": "sess-legacy", "time": {"created": 1577836800000_i64}}),
+        );
+        write_part(
+            dir.path(),
+            "msg-legacy",
+            &json!({"id": "p-legacy", "messageID": "msg-legacy", "type": "text", "text": "legacy"}),
+        );
+
+        // since_ts (2023-11-14) is after the DB session's 2020 update time, so the
+        // DB stream reads cleanly but emits zero sessions.
+        let connector = OpenCodeConnector::new();
+        let ctx = ScanContext::local_default(dir.path().to_path_buf(), Some(1_700_000_000_000));
+        let convs = connector.scan(&ctx).unwrap();
+        assert!(
+            convs.is_empty(),
+            "DB was read (authoritative) but matched no sessions for this since_ts; \
+             the legacy fallback must not run, yet it emitted: {:?}",
+            convs
+                .iter()
+                .filter_map(|c| c.external_id.as_deref())
+                .collect::<Vec<_>>()
         );
     }
 }

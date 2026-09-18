@@ -4,33 +4,70 @@
 
 pub mod aider;
 pub mod amp;
+#[cfg(feature = "antigravity")]
+pub mod antigravity;
 #[cfg(feature = "chatgpt")]
 pub mod chatgpt;
 pub mod claude_code;
 pub mod clawdbot;
 pub mod cline;
+#[cfg(feature = "codebuff")]
+pub mod codebuff;
 pub mod codex;
 pub mod copilot;
 pub mod copilot_cli;
+#[cfg(feature = "copilot-vscdb")]
+pub(crate) mod copilot_vscode;
 #[cfg(feature = "crush")]
 pub mod crush;
 #[cfg(feature = "cursor")]
 pub mod cursor;
+#[cfg(feature = "devin")]
+pub mod devin;
 pub mod factory;
 pub mod gemini;
 #[cfg(feature = "goose")]
 pub mod goose;
+#[cfg(feature = "upstream-extras")]
+pub mod grok;
+#[cfg(feature = "grok-bot")]
+pub mod grok_bot;
 #[cfg(feature = "hermes")]
 pub mod hermes;
+#[cfg(feature = "upstream-extras")]
 pub mod kimi;
+#[cfg(feature = "upstream-extras")]
+pub mod kiro;
+#[cfg(feature = "upstream-extras")]
+pub mod muse;
+#[cfg(feature = "upstream-extras")]
+pub mod omp;
 pub mod openclaw;
 #[cfg(feature = "opencode")]
 pub mod opencode;
 pub mod openhands;
 pub mod path_trie;
 pub mod pi_agent;
+#[cfg(feature = "upstream-extras")]
+pub mod pi_wire;
+#[cfg(feature = "upstream-extras")]
+pub mod prime_agent;
 pub mod qwen;
 pub mod scan;
+#[cfg(feature = "shelley")]
+pub mod shelley;
+#[cfg(any(
+    feature = "cursor",
+    feature = "opencode",
+    feature = "goose",
+    feature = "hermes",
+    feature = "crush",
+    feature = "devin",
+    feature = "shelley",
+    feature = "openclaw-sqlite",
+    feature = "copilot-vscdb"
+))]
+pub mod sqlite_sync;
 pub mod token_extraction;
 pub mod utils;
 pub mod vibe;
@@ -40,14 +77,17 @@ pub mod workspace_cache;
 mod conformance_tests;
 
 pub use path_trie::PathTrie;
-pub use scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+pub use scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
 pub use token_extraction::{
     ExtractedTokenUsage, ModelInfo, TokenDataSource, estimate_tokens_from_content,
     extract_claude_code_tokens, extract_codex_tokens, extract_tokens_for_agent, normalize_model,
 };
 pub use utils::{
     extract_invocations_from_content_blocks, file_modified_since, flatten_content, parse_timestamp,
-    unwrap_skill_invocations,
+    percent_decode_utf8, unwrap_skill_invocations,
 };
 pub use workspace_cache::WorkspaceCache;
 
@@ -103,6 +143,44 @@ pub trait Connector {
             on_conversation(conversation)?;
         }
         Ok(())
+    }
+
+    /// Whether `scan_with_source_boundaries()` emits trustworthy per-source
+    /// lifecycle events (FAD#22).
+    ///
+    /// `false` (the default) means the connector cannot prove source
+    /// boundaries; hosts must keep conservative resume behavior for it.
+    fn supports_source_boundaries(&self) -> bool {
+        false
+    }
+
+    /// Streaming scan with a per-source lifecycle for resumable ingestion
+    /// (FAD#22; cass gh#426).
+    ///
+    /// Contract for implementations that return `true` from
+    /// `supports_source_boundaries()`:
+    /// - source identity (provider slug, scan root, origin, canonical path,
+    ///   observed size/mtime) matches `discover_source_files()` exactly, with
+    ///   size/mtime captured BEFORE parsing begins;
+    /// - `hooks.should_scan()` runs before the source is parsed; a skipped
+    ///   source emits no conversations and no completion event;
+    /// - `hooks.complete()` fires only after EVERY conversation derived from
+    ///   that source has been delivered successfully — never on parse
+    ///   failure, conversation-callback failure, or cancellation;
+    /// - multi-file reconstruction sets name their required sidecars in the
+    ///   completion so the host knows which fingerprints authorize a skip.
+    ///
+    /// The default implementation is a truthful no-boundary fallback: it
+    /// delegates to `scan_with_callback()` and never invokes the hooks,
+    /// rather than fabricating guessed file boundaries.
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let _ = hooks;
+        self.scan_with_callback(ctx, on_conversation)
     }
 }
 
@@ -213,10 +291,25 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("clawdbot", || Box::new(clawdbot::ClawdbotConnector::new())),
         ("vibe", || Box::new(vibe::VibeConnector::new())),
         ("amp", || Box::new(amp::AmpConnector::new())),
+        #[cfg(feature = "antigravity")]
+        ("antigravity", || {
+            Box::new(antigravity::AntigravityConnector::new())
+        }),
         ("aider", || Box::new(aider::AiderConnector::new())),
         ("pi_agent", || Box::new(pi_agent::PiAgentConnector::new())),
+        #[cfg(feature = "upstream-extras")]
+        ("prime_agent", || {
+            Box::new(prime_agent::PrimeAgentConnector::new())
+        }),
+        #[cfg(feature = "upstream-extras")]
+        ("omp", || Box::new(omp::OmpConnector::new())),
         ("factory", || Box::new(factory::FactoryConnector::new())),
+        #[cfg(feature = "upstream-extras")]
         ("kimi", || Box::new(kimi::KimiConnector::new())),
+        #[cfg(feature = "upstream-extras")]
+        ("kiro", || Box::new(kiro::KiroConnector::new())),
+        #[cfg(feature = "upstream-extras")]
+        ("muse", || Box::new(muse::MuseConnector::new())),
         ("openclaw", || Box::new(openclaw::OpenClawConnector::new())),
         ("openhands", || {
             Box::new(openhands::OpenHandsConnector::new())
@@ -226,7 +319,15 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
             Box::new(copilot_cli::CopilotCliConnector::new())
         }),
         ("qwen", || Box::new(qwen::QwenConnector::new())),
+        #[cfg(feature = "upstream-extras")]
+        ("grok", || Box::new(grok::GrokConnector::new())),
+        #[cfg(feature = "devin")]
+        ("devin", || Box::new(devin::DevinConnector::new())),
     ];
+    #[cfg(feature = "grok-bot")]
+    v.push(("grok_bot", || Box::new(grok_bot::GrokBotConnector::new())));
+    #[cfg(feature = "codebuff")]
+    v.push(("codebuff", || Box::new(codebuff::CodebuffConnector::new())));
     #[cfg(feature = "opencode")]
     v.push(("opencode", || Box::new(opencode::OpenCodeConnector::new())));
     #[cfg(feature = "chatgpt")]
@@ -239,5 +340,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
     v.push(("crush", || Box::new(crush::CrushConnector::new())));
     #[cfg(feature = "hermes")]
     v.push(("hermes", || Box::new(hermes::HermesConnector::new())));
+    #[cfg(feature = "shelley")]
+    v.push(("shelley", || Box::new(shelley::ShelleyConnector::new())));
     v
 }

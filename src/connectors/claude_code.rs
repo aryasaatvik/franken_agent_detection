@@ -1,12 +1,18 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
-use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
-use super::utils::{env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded};
+use super::scan::{
+    DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot, SourceCompletion,
+    SourceScanHooks,
+};
+use super::utils::{
+    dedupe_path_key, env_path_nonempty, excluded_scan_paths_from_env, path_is_excluded,
+};
 use super::{
     Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
     franken_detection_for_connector, parse_timestamp,
@@ -233,6 +239,7 @@ impl ClaudeCodeConnector {
             }),
             invocations: Vec::new(),
             snippets: Vec::new(),
+            ..Default::default()
         })
     }
 
@@ -401,7 +408,12 @@ fn scan_claude_with_callback(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    scan_claude_with_callback_with_exclusions(ctx, on_conversation, &excluded_scan_paths_from_env())
+    scan_claude_with_callback_with_exclusions(
+        ctx,
+        on_conversation,
+        &excluded_scan_paths_from_env(),
+        &mut SourceScanHooks::default(),
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -409,20 +421,22 @@ fn scan_claude_with_callback_with_exclusions(
     ctx: &ScanContext,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     excluded_paths: &[PathBuf],
+    hooks: &mut SourceScanHooks<'_>,
 ) -> Result<()> {
-    let roots: Vec<PathBuf> = ClaudeCodeConnector::source_roots(ctx)
-        .into_iter()
-        .map(|root| root.path)
-        .collect();
+    let roots: Vec<ScanRoot> = ClaudeCodeConnector::source_roots(ctx);
+    // Overlapping explicit roots (or a symlinked CLAUDE_CONFIG_DIR aliasing
+    // another root) reach the same transcript twice; dedupe on the
+    // lossless path key across ALL roots, first occurrence wins.
+    let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
     let mut file_count = 0;
 
     for root in roots {
-        let explicit_file_root = root.is_file();
-        let scan_target = root.clone();
+        let explicit_file_root = root.path.is_file();
+        let scan_target = root.path.clone();
         let external_id_root = if explicit_file_root {
-            ClaudeCodeConnector::projects_root_for_explicit_file(&root)
-                .or_else(|| root.parent().map(Path::to_path_buf))
+            ClaudeCodeConnector::projects_root_for_explicit_file(&root.path)
+                .or_else(|| root.path.parent().map(Path::to_path_buf))
         } else {
             Some(scan_target.clone())
         };
@@ -445,8 +459,29 @@ fn scan_claude_with_callback_with_exclusions(
                 );
                 continue;
             }
+            if !seen_files.insert(dedupe_path_key(&path)) {
+                continue;
+            }
             let ext = path.extension().and_then(|s| s.to_str());
             if !file_modified_since(&path, ctx.since_ts) {
+                continue;
+            }
+            // Pre-parse source identity: constructed exactly like
+            // discover_sources_with_exclusions(), with size/mtime observed
+            // BEFORE the file is opened (FAD#22).
+            let discovered = DiscoveredSourceFile::new(
+                "claude_code",
+                &root,
+                path.clone(),
+                ClaudeCodeConnector::discovered_source_role(&path),
+                true,
+            )
+            .with_fs_metadata();
+            if !hooks.should_scan(&discovered) {
+                tracing::debug!(
+                    path = %path.display(),
+                    "claude_code host ledger skipped unchanged source"
+                );
                 continue;
             }
             let file_size_bytes = fs::metadata(&path).ok().map(|metadata| metadata.len());
@@ -475,6 +510,25 @@ fn scan_claude_with_callback_with_exclusions(
             let mut permission_mode: Option<String> = None;
             let mut source_kind = "claude_code";
 
+            // Subagent transcripts live at
+            // `<session>/subagents/agent-*.jsonl` and are separate
+            // conversations; surface the relationship instead of leaving the
+            // parent link implicit in the path.
+            let is_subagent_transcript = path
+                .components()
+                .any(|c| c.as_os_str().to_str() == Some("subagents"));
+            let mut parent_session_id: Option<String> = None;
+            if is_subagent_transcript {
+                let components: Vec<_> = path.components().collect();
+                if let Some(pos) = components
+                    .iter()
+                    .position(|c| c.as_os_str().to_str() == Some("subagents"))
+                    && pos > 0
+                {
+                    parent_session_id = components[pos - 1].as_os_str().to_str().map(String::from);
+                }
+            }
+
             if ext == Some("jsonl") {
                 let file = std::fs::File::open(&path)
                     .with_context(|| format!("open {}", path.display()))?;
@@ -487,7 +541,10 @@ fn scan_claude_with_callback_with_exclusions(
                     if line.trim().is_empty() {
                         continue;
                     }
-                    let Ok(val) = serde_json::from_str::<Value>(&line) else {
+                    // Strip a UTF-8 BOM so the first record (often
+                    // session_meta or the first prompt) is not silently lost.
+                    let line = line.trim_start_matches('\u{feff}');
+                    let Ok(val) = serde_json::from_str::<Value>(line) else {
                         continue;
                     };
 
@@ -508,6 +565,20 @@ fn scan_claude_with_callback_with_exclusions(
                     }
 
                     let entry_type = val.get("type").and_then(|v| v.as_str());
+                    // Claude's own generated title beats first-line
+                    // truncation; the entry is otherwise skipped as a
+                    // non-conversation sidecar type.
+                    if entry_type == Some("ai-title") {
+                        if let Some(title) = val
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                        {
+                            json_title = Some(title.to_string());
+                        }
+                        continue;
+                    }
                     let role_hint = val
                         .get("message")
                         .and_then(|m| m.get("role"))
@@ -517,6 +588,45 @@ fn scan_claude_with_callback_with_exclusions(
                         || (entry_type == Some("message")
                             && matches!(role_hint, Some("user" | "assistant")));
                     if !is_user_assistant {
+                        // A continuation file's compaction summary points its
+                        // `parentUuid` at the PREDECESSOR file's trailing
+                        // `type:"system"` boundary record — otherwise dropped here,
+                        // leaving the cross-file compaction edge dangling. Emit that
+                        // boundary as a minimal system message so its uuid is a
+                        // resolvable `msg_uid` and the downstream lineage resolver
+                        // can reconnect the two sessions. Only `system` rows that
+                        // carry a uuid qualify (plain metadata rows like
+                        // `custom-title` have none), so this stays rare. The marker
+                        // content is a sentinel: cass's direct-file export path
+                        // re-parses the raw jsonl and skips this record, so the
+                        // boundary lives in the index for lineage only.
+                        if entry_type == Some("system") {
+                            if let Some(uid) = val
+                                .get("uuid")
+                                .and_then(|v| v.as_str())
+                                .filter(|u| !u.is_empty())
+                            {
+                                messages.push(NormalizedMessage {
+                                    idx: 0,
+                                    role: "system".to_string(),
+                                    author: None,
+                                    created_at: val.get("timestamp").and_then(parse_timestamp),
+                                    content: "[compaction boundary]".to_string(),
+                                    extra: Value::Null,
+                                    snippets: Vec::new(),
+                                    invocations: Vec::new(),
+                                    msg_uid: Some(uid.to_string()),
+                                    parent_msg_uid: val
+                                        .get("parentUuid")
+                                        .and_then(|v| v.as_str())
+                                        .or_else(|| {
+                                            val.get("logicalParentUuid").and_then(|v| v.as_str())
+                                        })
+                                        .map(String::from),
+                                    is_sidechain: false,
+                                });
+                            }
+                        }
                         continue;
                     }
 
@@ -541,6 +651,60 @@ fn scan_claude_with_callback_with_exclusions(
                         .or_else(|| val.get("content"));
                     let content_str = content_val.map(flatten_content).unwrap_or_default();
 
+                    // Tool results ride in user entries as
+                    // content:[{type:"tool_result", tool_use_id, content}].
+                    // flatten_content ignores those blocks, so without this
+                    // pass every result entry is dropped wholesale
+                    // (~30-40% of real entries per transcript), leaving
+                    // invocations with call_ids but no outputs anywhere.
+                    if let Some(blocks) = content_val.and_then(Value::as_array) {
+                        for block in blocks {
+                            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                                continue;
+                            }
+                            let result_text = match block.get("content") {
+                                Some(Value::String(s)) => s.clone(),
+                                Some(Value::Array(parts)) => parts
+                                    .iter()
+                                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                _ => continue,
+                            };
+                            if result_text.trim().is_empty() {
+                                continue;
+                            }
+                            let mut tool_extra = Map::new();
+                            tool_extra.insert(
+                                "source".to_string(),
+                                Value::String("tool_result".to_string()),
+                            );
+                            if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                                tool_extra.insert(
+                                    "tool_use_id".to_string(),
+                                    Value::String(id.to_string()),
+                                );
+                            }
+                            // Failed tool calls are common and downstream
+                            // analytics split on them; pass the flag through
+                            // when Claude recorded one.
+                            if let Some(is_error) = block.get("is_error").and_then(Value::as_bool) {
+                                tool_extra.insert("is_error".to_string(), Value::from(is_error));
+                            }
+                            messages.push(NormalizedMessage {
+                                idx: 0,
+                                role: "tool".to_string(),
+                                author: None,
+                                created_at: created,
+                                content: result_text,
+                                extra: Value::Object(tool_extra),
+                                invocations: Vec::new(),
+                                snippets: Vec::new(),
+                                ..Default::default()
+                            });
+                        }
+                    }
+
                     if content_str.trim().is_empty() {
                         continue;
                     }
@@ -552,6 +716,21 @@ fn scan_claude_with_callback_with_exclusions(
                         .map(String::from);
                     let invocations =
                         content_val.map_or_else(Vec::new, extract_invocations_from_content_blocks);
+
+                    // Promote lineage to typed fields BEFORE `val` is moved into
+                    // `extra` (and before compaction strips the raw blob on huge
+                    // sessions). `logicalParentUuid` bridges a compaction boundary
+                    // when there is no direct `parentUuid`.
+                    let msg_uid = val.get("uuid").and_then(|v| v.as_str()).map(String::from);
+                    let parent_msg_uid = val
+                        .get("parentUuid")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| val.get("logicalParentUuid").and_then(|v| v.as_str()))
+                        .map(String::from);
+                    let is_sidechain = val
+                        .get("isSidechain")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
 
                     messages.push(NormalizedMessage {
                         idx: 0,
@@ -566,6 +745,9 @@ fn scan_claude_with_callback_with_exclusions(
                         },
                         invocations,
                         snippets: Vec::new(),
+                        msg_uid,
+                        parent_msg_uid,
+                        is_sidechain,
                     });
                 }
                 crate::types::reindex_messages(&mut messages);
@@ -659,6 +841,16 @@ fn scan_claude_with_callback_with_exclusions(
                             invocations: content_val
                                 .map_or_else(Vec::new, extract_invocations_from_content_blocks),
                             snippets: Vec::new(),
+                            msg_uid: item.get("uuid").and_then(|v| v.as_str()).map(String::from),
+                            parent_msg_uid: item
+                                .get("parentUuid")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| item.get("logicalParentUuid").and_then(|v| v.as_str()))
+                                .map(String::from),
+                            is_sidechain: item
+                                .get("isSidechain")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
                         });
                     }
                 }
@@ -703,6 +895,12 @@ fn scan_claude_with_callback_with_exclusions(
                     })
             });
 
+            // Promote thread id + branch to typed lineage fields. Cross-file
+            // resume/fork resolution (parent_external_id, lineage_relation) is a
+            // downstream cass pass; the connector only emits what one file knows.
+            let thread_external_id = session_id.clone();
+            let conv_git_branch = git_branch.clone();
+
             on_conversation(NormalizedConversation {
                 agent_slug: "claude_code".into(),
                 external_id: if source_kind == "claude_code_desktop_sidecar" {
@@ -730,10 +928,32 @@ fn scan_claude_with_callback_with_exclusions(
                     "cliSessionId": cli_session_id,
                     "gitBranch": git_branch,
                     "permissionMode": permission_mode,
-                    "bodyAvailable": source_kind != "claude_code_desktop_sidecar"
+                    "bodyAvailable": source_kind != "claude_code_desktop_sidecar",
+                    "sidechain": is_subagent_transcript,
+                    "parentSessionId": parent_session_id
                 }),
                 messages,
+                thread_external_id,
+                parent_external_id: None,
+                lineage_relation: None,
+                git_branch: conv_git_branch,
             })?;
+
+            // Source complete: the (single) conversation derived from this
+            // transcript was delivered. Suppressed when the file changed
+            // while it was being parsed — the host must re-observe it.
+            if discovered.fs_metadata_changed() {
+                tracing::debug!(
+                    path = %path.display(),
+                    "claude_code source changed during parse; completion withheld"
+                );
+            } else {
+                hooks.complete(&SourceCompletion {
+                    source: discovered,
+                    required_sidecars: Vec::new(),
+                    conversations_emitted: 1,
+                })?;
+            }
         }
     }
 
@@ -769,6 +989,24 @@ impl Connector for ClaudeCodeConnector {
     ) -> Result<()> {
         scan_claude_with_callback(ctx, on_conversation)
     }
+
+    fn supports_source_boundaries(&self) -> bool {
+        true
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        scan_claude_with_callback_with_exclusions(
+            ctx,
+            on_conversation,
+            &excluded_scan_paths_from_env(),
+            hooks,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -795,6 +1033,67 @@ mod tests {
     fn new_creates_connector() {
         let connector = ClaudeCodeConnector::new();
         let _ = connector;
+    }
+
+    #[test]
+    fn scan_marks_subagent_transcripts_with_parent_link() {
+        let base = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(base.path());
+        let session_dir = claude_dir
+            .join("projects")
+            .join("-data-projects-demo")
+            .join("11111111-2222-3333-4444-555555555555");
+        let subagents = session_dir
+            .join("subagents")
+            .join("66666666-7777-8888-9999-000000000000");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(
+            subagents.join("agent-abc123.jsonl"),
+            concat!(
+                r#"{"type":"assistant","sessionId":"66666666-7777-8888-9999-000000000000","message":{"role":"assistant","model":"claude-x","content":[{"type":"text","text":"subagent work"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].metadata["sidechain"], true);
+        assert_eq!(
+            convs[0].metadata["parentSessionId"],
+            "11111111-2222-3333-4444-555555555555"
+        );
+    }
+
+    #[test]
+    fn scan_prefers_ai_title_over_first_line_truncation() {
+        let base = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(base.path());
+        let session_dir = claude_dir
+            .join("projects")
+            .join("-data-projects-demo")
+            .join("aaaa-bbbb");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("cccc-dddd.jsonl"),
+            concat!(
+                r#"{"type":"ai-title","title":"Fix the flaky auth test"}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"cccc-dddd","message":{"role":"user","content":[{"type":"text","text":"please look at the auth module and fix the flaky test"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir, None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].title.as_deref(), Some("Fix the flaky auth test"));
     }
 
     #[test]
@@ -980,6 +1279,47 @@ mod tests {
     }
 
     #[test]
+    fn scan_emits_dropped_system_boundary_as_resolvable_message() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+
+        // A continuation file: a `type:"system"` boundary record carrying a uuid
+        // (the predecessor leaf a compaction-summary `parentUuid` points at),
+        // then the compaction summary and a normal turn. The boundary must be
+        // emitted as a minimal system message so its uuid is a resolvable
+        // `msg_uid` and a downstream resolver can reconnect the continuation to
+        // its predecessor.
+        let session_file = claude_dir.join("session.jsonl");
+        let content = r#"{"type":"system","uuid":"boundary-uid-123","parentUuid":null,"content":""}
+{"type":"user","uuid":"u1","parentUuid":"boundary-uid-123","isCompactSummary":true,"timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"This session is being continued from a previous conversation."}}
+{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2025-12-01T10:00:01Z","message":{"role":"assistant","content":"Picking up where we left off."}}
+"#;
+        fs::write(&session_file, content).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        // boundary system message + summary + assistant.
+        assert_eq!(convs[0].messages.len(), 3);
+        let boundary = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.msg_uid.as_deref() == Some("boundary-uid-123"))
+            .expect("boundary system message must be emitted with its uuid as msg_uid");
+        assert_eq!(boundary.role, "system");
+        // The summary's parent edge points at that boundary uid (the dangling
+        // cross-file edge the resolver reconnects).
+        let summary = convs[0]
+            .messages
+            .iter()
+            .find(|m| m.content.contains("being continued"))
+            .expect("summary message present");
+        assert_eq!(summary.parent_msg_uid.as_deref(), Some("boundary-uid-123"));
+    }
+
+    #[test]
     fn scan_with_callback_matches_scan_for_jsonl_session() {
         let dir = TempDir::new().unwrap();
         let claude_dir = make_test_claude_dir(dir.path());
@@ -1014,6 +1354,88 @@ mod tests {
     }
 
     #[test]
+    fn source_boundaries_complete_per_file_and_skip_on_resume() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = make_test_claude_dir(dir.path());
+        for name in ["a.jsonl", "b.jsonl"] {
+            fs::write(
+                claude_dir.join(name),
+                concat!(
+                    r#"{"type":"user","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"Hello"}}"#,
+                    "\n",
+                ),
+            )
+            .unwrap();
+        }
+
+        let connector = ClaudeCodeConnector::new();
+        assert!(connector.supports_source_boundaries());
+        let ctx = ScanContext::local_default(claude_dir.clone(), None);
+
+        let mut completions: Vec<SourceCompletion> = Vec::new();
+        let mut emitted = 0usize;
+        {
+            let mut on_complete = |completion: &SourceCompletion| {
+                completions.push(completion.clone());
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut on_complete),
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
+                    emitted += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(emitted, 2);
+        assert_eq!(completions.len(), 2, "one completion per session file");
+        for completion in &completions {
+            assert_eq!(completion.conversations_emitted, 1);
+            assert_eq!(completion.source.provider_slug, "claude_code");
+            assert!(completion.source.size_bytes.is_some());
+            assert!(completion.required_sidecars.is_empty());
+        }
+
+        // Identity matches discovery for every completed source.
+        let discovered = connector.discover_source_files(&ctx).unwrap();
+        for completion in &completions {
+            let matching = discovered
+                .iter()
+                .find(|source| source.source_path == completion.source.source_path)
+                .expect("completed source must be discoverable");
+            assert_eq!(completion.source.size_bytes, matching.size_bytes);
+            assert_eq!(completion.source.modified_at_ms, matching.modified_at_ms);
+        }
+
+        // Resume with a ledger built from the completions: nothing re-parsed.
+        let ledger: Vec<SourceCompletion> = completions;
+        let mut resumed = 0usize;
+        {
+            let mut should_scan = |source: &DiscoveredSourceFile| {
+                !ledger.iter().any(|entry| {
+                    entry.source.source_path == source.source_path
+                        && entry.source.size_bytes == source.size_bytes
+                        && entry.source.modified_at_ms == source.modified_at_ms
+                })
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: Some(&mut should_scan),
+                on_source_complete: None,
+            };
+            connector
+                .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_conv| {
+                    resumed += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(resumed, 0, "unchanged files must be skipped on resume");
+    }
+
+    #[test]
     fn scan_skips_explicitly_excluded_session_path_without_skipping_siblings() {
         let dir = TempDir::new().unwrap();
         let claude_dir = make_test_claude_dir(dir.path());
@@ -1040,6 +1462,7 @@ mod tests {
                 Ok(())
             },
             std::slice::from_ref(&active_session),
+            &mut SourceScanHooks::default(),
         )
         .unwrap();
 

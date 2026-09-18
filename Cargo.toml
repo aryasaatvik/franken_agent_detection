@@ -31,9 +31,11 @@ urlencoding = { version = "2", optional = true }
 # --- Optional: ChatGPT encrypted conversations ---
 aes-gcm = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
+blake3 = { version = "1", optional = true }
+url = { version = "2", optional = true }
 
 # --- Optional: SQLite-backed session databases ---
-frankensqlite = { version = "0.1.2", package = "fsqlite", optional = true }
+rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 
 [features]
 default = []
@@ -50,17 +52,28 @@ connectors = [
 # ChatGPT: AES-256-GCM decryption for v2/v3 encrypted conversations
 chatgpt = ["connectors", "dep:aes-gcm", "dep:base64"]
 # Cursor: SQLite database access for state.vscdb
-cursor = ["connectors", "dep:frankensqlite", "dep:urlencoding"]
+cursor = ["connectors", "dep:rusqlite", "dep:urlencoding"]
 # OpenCode: SQLite database access for v1.2+ opencode.db
-opencode = ["connectors", "dep:frankensqlite", "dep:urlencoding"]
+opencode = ["connectors", "dep:rusqlite", "dep:urlencoding"]
 # Goose: SQLite database access for Goose sessions.db
-goose = ["connectors", "dep:frankensqlite", "dep:urlencoding"]
+goose = ["connectors", "dep:rusqlite", "dep:urlencoding"]
 # Hermes: SQLite database access for Hermes Agent state.db
-hermes = ["connectors", "dep:frankensqlite", "dep:urlencoding"]
+hermes = ["connectors", "dep:rusqlite", "dep:urlencoding"]
 # Crush: SQLite database access for Charm's Crush agent
-crush = ["connectors", "dep:frankensqlite"]
+crush = ["connectors", "dep:rusqlite"]
+devin = ["connectors", "dep:rusqlite", "dep:urlencoding"]
+antigravity = ["connectors"]
+grok-bot = ["connectors"]
+codebuff = ["connectors"]
+shelley = ["connectors", "dep:rusqlite", "dep:blake3", "dep:base64", "dep:url"]
+openclaw-sqlite = ["connectors", "dep:rusqlite"]
+copilot-vscdb = ["connectors", "dep:rusqlite"]
+# New upstream connectors whose normalized contracts still require a separate
+# lineage reconciliation pass. They remain opt-in and are not part of the
+# production all-connectors profile until that pass is complete.
+upstream-extras = ["connectors", "codebuff", "grok-bot"]
 # All connectors enabled
-all-connectors = ["connectors", "chatgpt", "cursor", "opencode", "goose", "hermes", "crush"]
+all-connectors = ["connectors", "chatgpt", "cursor", "devin", "antigravity", "opencode", "goose", "hermes", "crush", "shelley", "copilot-vscdb", "codebuff", "grok-bot"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -75,3 +88,4 @@ nursery = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+assert_is_empty = "allow"
