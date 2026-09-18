@@ -700,6 +700,7 @@ fn scan_claude_with_callback_with_exclusions(
                                 extra: Value::Object(tool_extra),
                                 invocations: Vec::new(),
                                 snippets: Vec::new(),
+                                ..Default::default()
                             });
                         }
                     }

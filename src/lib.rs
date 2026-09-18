@@ -42,6 +42,8 @@ pub use connectors::codebuff::CodebuffConnector;
 pub use connectors::crush::CrushConnector;
 #[cfg(feature = "cursor")]
 pub use connectors::cursor::CursorConnector;
+#[cfg(all(feature = "connectors", feature = "devin"))]
+pub use connectors::devin::DevinConnector;
 #[cfg(feature = "goose")]
 pub use connectors::goose::GooseConnector;
 #[cfg(feature = "grok-bot")]
@@ -58,16 +60,19 @@ pub use connectors::token_extraction::{ExtractedTokenUsage, ModelInfo, TokenData
 pub use connectors::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, PathTrie, ScanContext, ScanRoot,
     SourceCompletion, SourceScanHooks, WorkspaceCache, aider::AiderConnector, amp::AmpConnector,
-    antigravity::AntigravityConnector, claude_code::ClaudeCodeConnector,
-    clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
-    copilot::CopilotConnector, copilot_cli::CopilotCliConnector, devin::DevinConnector,
+    claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
+    codex::CodexConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
     estimate_tokens_from_content, extract_claude_code_tokens, extract_codex_tokens,
     extract_invocations_from_content_blocks, extract_tokens_for_agent, factory::FactoryConnector,
     file_modified_since, flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
-    get_connector_factories, grok::GrokConnector, kimi::KimiConnector, kiro::KiroConnector,
-    normalize_model, omp::OmpConnector, openclaw::OpenClawConnector, openhands::OpenHandsConnector,
-    parse_timestamp, pi_agent::PiAgentConnector, prime_agent::PrimeAgentConnector,
+    get_connector_factories, normalize_model, openclaw::OpenClawConnector,
+    openhands::OpenHandsConnector, parse_timestamp, pi_agent::PiAgentConnector,
     qwen::QwenConnector, token_extraction, vibe::VibeConnector,
+};
+#[cfg(all(feature = "connectors", feature = "upstream-extras"))]
+pub use connectors::{
+    antigravity::AntigravityConnector, grok::GrokConnector, kimi::KimiConnector,
+    kiro::KiroConnector, omp::OmpConnector, prime_agent::PrimeAgentConnector,
 };
 
 use serde::{Deserialize, Serialize};

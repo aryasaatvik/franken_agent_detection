@@ -406,11 +406,11 @@ impl ChatGptConnector {
             anyhow::bail!("Encrypted data too short: {} bytes", data.len());
         }
 
-        // Extract nonce from the beginning. (`Nonce::from_slice` is
-        // deprecated in aes-gcm 0.11; TryFrom keeps the length check
-        // explicit.)
-        let nonce = Nonce::try_from(&data[..NONCE_SIZE])
+        // Extract nonce from the beginning with an explicit fixed-size copy.
+        let nonce_bytes: [u8; NONCE_SIZE] = data[..NONCE_SIZE]
+            .try_into()
             .map_err(|_| anyhow::anyhow!("invalid nonce length in encrypted file"))?;
+        let nonce = Nonce::from(nonce_bytes);
 
         // The rest is ciphertext + tag
         let ciphertext = &data[NONCE_SIZE..];

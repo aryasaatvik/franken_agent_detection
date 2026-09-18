@@ -44,14 +44,14 @@ use std::path::Path;
 #[cfg(feature = "devin")]
 use anyhow::{Context, Result};
 #[cfg(feature = "devin")]
-use frankensqlite::compat::{OpenFlags, RowExt};
+use rusqlite::params;
 #[cfg(feature = "devin")]
-use frankensqlite::params;
+use rusqlite::{OpenFlags, Row};
 
 #[cfg(feature = "devin")]
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 #[cfg(feature = "devin")]
-use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::sqlite_sync::{Connection, ConnectionExt, RowExt, open_with_flags};
 #[cfg(feature = "devin")]
 use super::utils::env_path_nonempty;
 #[cfg(feature = "devin")]
@@ -258,6 +258,7 @@ impl DevinConnector {
                     "source": "sqlite",
                 }),
                 messages,
+                ..Default::default()
             });
         }
         Ok(conversations)
@@ -266,7 +267,7 @@ impl DevinConnector {
     fn load_sessions(conn: &Connection) -> Result<Vec<DevinSession>> {
         const COLUMNS: &str = "id, title, working_directory, model, agent_mode, \
                                created_at, last_activity_at, main_chain_id";
-        let map_row = |row: &frankensqlite::Row| {
+        let map_row = |row: &Row<'_>| {
             Ok(DevinSession {
                 id: row.get_typed::<Option<String>>(0)?.unwrap_or_default(),
                 title: row.get_typed(1)?,
@@ -481,6 +482,7 @@ pub(crate) fn message_from_chat_message(
                 extra: serde_json::Value::Object(extra),
                 snippets: Vec::new(),
                 invocations: Vec::new(),
+                ..Default::default()
             }
         }
         "assistant" => {
@@ -535,6 +537,7 @@ pub(crate) fn message_from_chat_message(
                 extra: serde_json::Value::Object(extra),
                 snippets: Vec::new(),
                 invocations,
+                ..Default::default()
             }
         }
         "tool" => {
@@ -557,6 +560,7 @@ pub(crate) fn message_from_chat_message(
                 extra: serde_json::Value::Object(extra),
                 snippets: Vec::new(),
                 invocations: Vec::new(),
+                ..Default::default()
             }
         }
         _ => return None,

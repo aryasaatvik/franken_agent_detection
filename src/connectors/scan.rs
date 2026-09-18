@@ -149,6 +149,9 @@ pub struct ScanContext {
 
     /// Optional liveness tick for long pre-first-yield scans (cass#373 Variant A).
     pub progress_tick: Option<ScanProgressTick>,
+
+    /// Include archived session stores when a connector supports them.
+    pub include_archived_sessions: bool,
 }
 
 impl std::fmt::Debug for ScanContext {
@@ -174,6 +177,7 @@ impl ScanContext {
             scan_roots: Vec::new(),
             since_ts,
             progress_tick: None,
+            include_archived_sessions: false,
         }
     }
 
@@ -189,6 +193,7 @@ impl ScanContext {
             scan_roots,
             since_ts,
             progress_tick: None,
+            include_archived_sessions: false,
         }
     }
 

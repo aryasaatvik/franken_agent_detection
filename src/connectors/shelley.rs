@@ -34,17 +34,17 @@
 //!     participant emails, image/base64 payloads, signatures, or encrypted
 //!     continuation data.
 //!
-//! **NOTE:** This connector uses `frankensqlite`. See AGENTS.md RULE 2.
+//! SQLite reads use the fork's canonical bundled `rusqlite` backend.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use frankensqlite::compat::{OpenFlags, ParamValue, RowExt};
+use rusqlite::{OpenFlags, Row};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::sqlite_sync::{Connection, ConnectionExt, RowExt, open_with_flags};
 use super::utils::env_path_nonempty;
 use super::{Connector, franken_detection_for_connector};
 use crate::types::{
@@ -477,7 +477,7 @@ const REQUIRED_MSG_COLS: &[&str] = &[
 
 fn table_columns(conn: &Connection, table: &str) -> Result<HashSet<String>> {
     let rows: Vec<String> = conn
-        .query_map_collect(&format!("PRAGMA table_info({table})"), &[], |row| {
+        .query_map_collect(&format!("PRAGMA table_info({table})"), [], |row| {
             row.get_typed::<String>(1)
         })
         .with_context(|| format!("failed to read column list for table {table}"))?;
@@ -514,7 +514,7 @@ fn admit_database(path: &Path, kind: CandidateKind) -> Result<(Connection, Schem
         .query_map_collect(
             "SELECT name, type FROM sqlite_master \
              WHERE name IN ('migrations','conversations','messages')",
-            &[],
+            [],
             |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
         )
         .with_context(|| "failed to read sqlite schema")?;
@@ -551,7 +551,7 @@ fn admit_database(path: &Path, kind: CandidateKind) -> Result<(Connection, Schem
         let base_migrations: i64 = conn.query_row_map(
             "SELECT COUNT(*) FROM migrations WHERE migration_name IN \
              ('001-conversations.sql','002-messages.sql','003-add-message-sequence.sql')",
-            &[],
+            [],
             |row| row.get_typed::<i64>(0),
         )?;
         if base_migrations < 3 {
@@ -619,32 +619,23 @@ struct ConvRow {
     tags: Option<String>,
 }
 
-fn opt_flag(
-    row: &frankensqlite::Row,
-    idx: Option<usize>,
-) -> Result<bool, frankensqlite::FrankenError> {
+fn opt_flag(row: &Row<'_>, idx: Option<usize>) -> rusqlite::Result<bool> {
     idx.map_or(Ok(false), |i| {
         Ok(row.get_typed::<Option<i64>>(i)?.unwrap_or(0) != 0)
     })
 }
 
-fn opt_text(
-    row: &frankensqlite::Row,
-    idx: Option<usize>,
-) -> Result<Option<String>, frankensqlite::FrankenError> {
+fn opt_text(row: &Row<'_>, idx: Option<usize>) -> rusqlite::Result<Option<String>> {
     idx.map_or(Ok(None), |i| row.get_typed::<Option<String>>(i))
 }
 
-fn opt_int(
-    row: &frankensqlite::Row,
-    idx: Option<usize>,
-) -> Result<Option<i64>, frankensqlite::FrankenError> {
+fn opt_int(row: &Row<'_>, idx: Option<usize>) -> rusqlite::Result<Option<i64>> {
     idx.map_or(Ok(None), |i| row.get_typed::<Option<i64>>(i))
 }
 
 /// Read a Shelley DATETIME column leniently: TEXT timestamps from Go drivers
 /// in several layouts, or numeric epoch seconds/milliseconds.
-fn read_ts(row: &frankensqlite::Row, idx: usize) -> Option<i64> {
+fn read_ts(row: &Row<'_>, idx: usize) -> Option<i64> {
     if let Ok(Some(text)) = row.get_typed::<Option<String>>(idx) {
         if let Some(ms) = parse_shelley_timestamp(&text) {
             return Some(ms);
@@ -744,7 +735,7 @@ fn load_conversations(conn: &Connection, plan: &SchemaPlan) -> Result<Vec<ConvRo
         "SELECT {} FROM conversations ORDER BY conversation_id",
         cols.select
     );
-    conn.query_map_collect(&sql, &[], |row| {
+    conn.query_map_collect(&sql, [], |row| {
         Ok(ConvRow {
             conversation_id: row.get_typed::<String>(cols.req("conversation_id"))?,
             slug: row.get_typed::<Option<String>>(cols.req("slug"))?,
@@ -812,31 +803,29 @@ fn for_each_message(
     let mut last_seq: i64 = i64::MIN;
     let mut last_id = String::new();
     loop {
-        let params = [
-            ParamValue::from(conversation_id.to_string()),
-            ParamValue::from(last_seq),
-            ParamValue::from(last_seq),
-            ParamValue::from(last_id.clone()),
-        ];
         let batch: Vec<MsgRow> = conn
-            .query_map_collect(&sql, &params, |row| {
-                Ok(MsgRow {
-                    message_id: row.get_typed::<String>(cols.req("message_id"))?,
-                    sequence_id: row.get_typed::<i64>(cols.req("sequence_id"))?,
-                    mtype: row.get_typed::<String>(cols.req("type"))?,
-                    llm_data: row.get_typed::<Option<String>>(cols.req("llm_data"))?,
-                    user_data: row.get_typed::<Option<String>>(cols.req("user_data"))?,
-                    usage_data: row.get_typed::<Option<String>>(cols.req("usage_data"))?,
-                    created_at: read_ts(row, cols.req("created_at")),
-                    display_data: opt_text(row, cols.idx("display_data"))?,
-                    excluded_from_context: opt_flag(row, cols.idx("excluded_from_context"))?,
-                    generation: opt_int(row, cols.idx("generation"))?.unwrap_or(0),
-                    llm_api_url: opt_text(row, cols.idx("llm_api_url"))?,
-                    model_name: opt_text(row, cols.idx("model_name"))?,
-                    forked_from_message_id: opt_text(row, cols.idx("forked_from_message_id"))?,
-                    other_usage_data: opt_text(row, cols.idx("other_usage_data"))?,
-                })
-            })
+            .query_map_collect(
+                &sql,
+                rusqlite::params![conversation_id, last_seq, last_seq, last_id],
+                |row| {
+                    Ok(MsgRow {
+                        message_id: row.get_typed::<String>(cols.req("message_id"))?,
+                        sequence_id: row.get_typed::<i64>(cols.req("sequence_id"))?,
+                        mtype: row.get_typed::<String>(cols.req("type"))?,
+                        llm_data: row.get_typed::<Option<String>>(cols.req("llm_data"))?,
+                        user_data: row.get_typed::<Option<String>>(cols.req("user_data"))?,
+                        usage_data: row.get_typed::<Option<String>>(cols.req("usage_data"))?,
+                        created_at: read_ts(row, cols.req("created_at")),
+                        display_data: opt_text(row, cols.idx("display_data"))?,
+                        excluded_from_context: opt_flag(row, cols.idx("excluded_from_context"))?,
+                        generation: opt_int(row, cols.idx("generation"))?.unwrap_or(0),
+                        llm_api_url: opt_text(row, cols.idx("llm_api_url"))?,
+                        model_name: opt_text(row, cols.idx("model_name"))?,
+                        forked_from_message_id: opt_text(row, cols.idx("forked_from_message_id"))?,
+                        other_usage_data: opt_text(row, cols.idx("other_usage_data"))?,
+                    })
+                },
+            )
             .with_context(|| format!("failed to read messages for {conversation_id}"))?;
         let batch_len = batch.len();
         for row in batch {
@@ -857,7 +846,7 @@ fn message_activity(conn: &Connection) -> Result<HashMap<String, (i64, Option<i6
         .query_map_collect(
             "SELECT conversation_id, COUNT(*), MAX(created_at) FROM messages \
              GROUP BY conversation_id",
-            &[],
+            [],
             |row| {
                 Ok((
                     row.get_typed::<String>(0)?,
@@ -1024,6 +1013,7 @@ fn conversation_shell(
         ended_at: ended_at.or(conv.updated_at),
         metadata,
         messages,
+        ..Default::default()
     }
 }
 
@@ -1215,6 +1205,7 @@ impl ProjectedMessage {
             extra: Value::Object(self.extra),
             invocations: self.invocations,
             snippets: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -1875,7 +1866,7 @@ fn enforce_extra_budget(extra: &mut serde_json::Map<String, Value>) {
 #[allow(clippy::similar_names)] // conn/conv/convs fixture bindings are idiomatic here
 mod tests {
     use super::*;
-    use frankensqlite::params;
+    use rusqlite::params;
 
     fn fixture_schema(conn: &Connection, with_migrations: bool) {
         conn.execute_batch(
@@ -2592,7 +2583,7 @@ mod tests {
         let db_path = std::fs::canonicalize(build_fixture(tmp.path(), "wal.db", false)).unwrap();
         let writer = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
         let mode: String = writer
-            .query_row_map("PRAGMA journal_mode=wal;", &[], |row| {
+            .query_row_map("PRAGMA journal_mode=wal;", [], |row| {
                 row.get_typed::<String>(0)
             })
             .unwrap();

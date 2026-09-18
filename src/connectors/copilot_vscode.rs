@@ -906,6 +906,7 @@ pub fn session_to_conversation(
                 extra: Value::Object(extra),
                 invocations: Vec::new(),
                 snippets: Vec::new(),
+                ..Default::default()
             });
         }
 
@@ -932,6 +933,7 @@ pub fn session_to_conversation(
                 extra: Value::Object(extra),
                 invocations,
                 snippets: Vec::new(),
+                ..Default::default()
             });
         }
     }
@@ -992,6 +994,7 @@ pub fn session_to_conversation(
         ended_at,
         metadata: Value::Object(metadata),
         messages,
+        ..Default::default()
     })
 }
 
@@ -1004,10 +1007,9 @@ pub fn session_to_conversation(
 /// in-memory map shape defensively.
 #[cfg(feature = "copilot-vscdb")]
 fn sessions_from_state_db(db_path: &Path) -> Vec<Value> {
-    use frankensqlite::compat::{OpenFlags, RowExt};
-    use frankensqlite::params;
+    use rusqlite::{OpenFlags, params};
 
-    use super::sqlite_sync::{ConnectionExt, open_with_flags};
+    use super::sqlite_sync::{ConnectionExt, RowExt, open_with_flags};
 
     let conn = match open_with_flags(
         db_path.to_string_lossy().as_ref(),
@@ -1775,7 +1777,7 @@ mod tests {
     mod state_db {
         use super::*;
         use crate::connectors::sqlite_sync::{Connection, ConnectionExt};
-        use frankensqlite::params;
+        use rusqlite::params;
 
         fn write_state_db(db_path: &Path, sessions: &Value) {
             fs::create_dir_all(db_path.parent().expect("parent")).expect("mkdir");

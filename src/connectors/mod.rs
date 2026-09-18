@@ -4,35 +4,43 @@
 
 pub mod aider;
 pub mod amp;
+#[cfg(feature = "upstream-extras")]
 pub mod antigravity;
 #[cfg(feature = "chatgpt")]
 pub mod chatgpt;
 pub mod claude_code;
 pub mod clawdbot;
 pub mod cline;
-#[cfg(feature = "codebuff")]
+#[cfg(all(feature = "codebuff", feature = "upstream-extras"))]
 pub mod codebuff;
 pub mod codex;
 pub mod copilot;
 pub mod copilot_cli;
+#[cfg(feature = "copilot-vscdb")]
 pub(crate) mod copilot_vscode;
 #[cfg(feature = "crush")]
 pub mod crush;
 #[cfg(feature = "cursor")]
 pub mod cursor;
+#[cfg(feature = "devin")]
 pub mod devin;
 pub mod factory;
 pub mod gemini;
 #[cfg(feature = "goose")]
 pub mod goose;
+#[cfg(feature = "upstream-extras")]
 pub mod grok;
-#[cfg(feature = "grok-bot")]
+#[cfg(all(feature = "grok-bot", feature = "upstream-extras"))]
 pub mod grok_bot;
 #[cfg(feature = "hermes")]
 pub mod hermes;
+#[cfg(feature = "upstream-extras")]
 pub mod kimi;
+#[cfg(feature = "upstream-extras")]
 pub mod kiro;
+#[cfg(feature = "upstream-extras")]
 pub mod muse;
+#[cfg(feature = "upstream-extras")]
 pub mod omp;
 pub mod openclaw;
 #[cfg(feature = "opencode")]
@@ -40,7 +48,9 @@ pub mod opencode;
 pub mod openhands;
 pub mod path_trie;
 pub mod pi_agent;
+#[cfg(feature = "upstream-extras")]
 pub mod pi_wire;
+#[cfg(feature = "upstream-extras")]
 pub mod prime_agent;
 pub mod qwen;
 pub mod scan;
@@ -281,18 +291,24 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("clawdbot", || Box::new(clawdbot::ClawdbotConnector::new())),
         ("vibe", || Box::new(vibe::VibeConnector::new())),
         ("amp", || Box::new(amp::AmpConnector::new())),
+        #[cfg(feature = "upstream-extras")]
         ("antigravity", || {
             Box::new(antigravity::AntigravityConnector::new())
         }),
         ("aider", || Box::new(aider::AiderConnector::new())),
         ("pi_agent", || Box::new(pi_agent::PiAgentConnector::new())),
+        #[cfg(feature = "upstream-extras")]
         ("prime_agent", || {
             Box::new(prime_agent::PrimeAgentConnector::new())
         }),
+        #[cfg(feature = "upstream-extras")]
         ("omp", || Box::new(omp::OmpConnector::new())),
         ("factory", || Box::new(factory::FactoryConnector::new())),
+        #[cfg(feature = "upstream-extras")]
         ("kimi", || Box::new(kimi::KimiConnector::new())),
+        #[cfg(feature = "upstream-extras")]
         ("kiro", || Box::new(kiro::KiroConnector::new())),
+        #[cfg(feature = "upstream-extras")]
         ("muse", || Box::new(muse::MuseConnector::new())),
         ("openclaw", || Box::new(openclaw::OpenClawConnector::new())),
         ("openhands", || {
@@ -303,12 +319,14 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
             Box::new(copilot_cli::CopilotCliConnector::new())
         }),
         ("qwen", || Box::new(qwen::QwenConnector::new())),
+        #[cfg(feature = "upstream-extras")]
         ("grok", || Box::new(grok::GrokConnector::new())),
+        #[cfg(feature = "devin")]
         ("devin", || Box::new(devin::DevinConnector::new())),
     ];
-    #[cfg(feature = "grok-bot")]
+    #[cfg(all(feature = "grok-bot", feature = "upstream-extras"))]
     v.push(("grok_bot", || Box::new(grok_bot::GrokBotConnector::new())));
-    #[cfg(feature = "codebuff")]
+    #[cfg(all(feature = "codebuff", feature = "upstream-extras"))]
     v.push(("codebuff", || Box::new(codebuff::CodebuffConnector::new())));
     #[cfg(feature = "opencode")]
     v.push(("opencode", || Box::new(opencode::OpenCodeConnector::new())));

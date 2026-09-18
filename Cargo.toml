@@ -67,8 +67,12 @@ codebuff = ["connectors"]
 shelley = ["connectors", "dep:rusqlite", "dep:blake3", "dep:base64", "dep:url"]
 openclaw-sqlite = ["connectors", "dep:rusqlite"]
 copilot-vscdb = ["connectors", "dep:rusqlite"]
+# New upstream connectors whose normalized contracts still require a separate
+# lineage reconciliation pass. They remain opt-in and are not part of the
+# production all-connectors profile until that pass is complete.
+upstream-extras = ["connectors", "codebuff", "grok-bot"]
 # All connectors enabled
-all-connectors = ["connectors", "chatgpt", "codebuff", "cursor", "devin", "opencode", "goose", "grok-bot", "hermes", "crush", "shelley", "openclaw-sqlite", "copilot-vscdb"]
+all-connectors = ["connectors", "chatgpt", "cursor", "devin", "opencode", "goose", "hermes", "crush", "shelley", "copilot-vscdb"]
 
 [dev-dependencies]
 tempfile = "3"
