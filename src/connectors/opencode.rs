@@ -28,6 +28,7 @@
 )]
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -500,7 +501,7 @@ impl OpenCodeConnector {
         // Read timestamps as raw SQLite values — Drizzle ORM may store them as ISO
         // text (YYYY-MM-DD HH:MM:SS) or epoch integers; we normalize in Rust rather
         // than using strftime() which breaks on integer columns.
-        let sessions: Vec<SqliteSession> = {
+        let sessions: Vec<SqliteSession> = if has_table(&conn, "session") {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, title, directory, project_id, time_created, time_updated FROM session",
@@ -519,13 +520,114 @@ impl OpenCodeConnector {
             .with_context(|| "failed to query OpenCode sessions")?
             .collect::<rusqlite::Result<Vec<_>>>()
             .with_context(|| "failed to read OpenCode session rows")?
+        } else {
+            Vec::new()
         };
+
+        // OpenCode 2.x keeps the new session/message stream beside the legacy
+        // tables.  Read it first; legacy sessions are still processed below so
+        // databases in the middle of migration remain readable.
+        if has_opencode_v2_tables(&conn) {
+            let mut v2_stmt = conn
+                .prepare(
+                    "SELECT id, title, directory, project_id, time_created, time_updated, version, parent_id
+                     FROM session_v2",
+                )
+                .with_context(|| "failed to prepare OpenCode v2 sessions query")?;
+            let v2_sessions = v2_stmt
+                .query_map([], |row| {
+                    Ok(SqliteV2Session {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        directory: row.get(2)?,
+                        project_id: row.get(3)?,
+                        time_created_raw: optional_sqlite_value(row, 4),
+                        time_updated_raw: optional_sqlite_value(row, 5),
+                        version: optional_sqlite_value(row, 6),
+                        parent_id: row.get(7)?,
+                    })
+                })
+                .with_context(|| "failed to query OpenCode v2 sessions")?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .with_context(|| "failed to read OpenCode v2 session rows")?;
+            let mut v2_msg_stmt = conn
+                .prepare(
+                    "SELECT id, seq, type, data FROM session_message
+                     WHERE session_id = ?1 ORDER BY seq ASC",
+                )
+                .with_context(|| "failed to prepare OpenCode v2 messages query")?;
+
+            for session in v2_sessions {
+                let created = session
+                    .time_created_raw
+                    .as_ref()
+                    .and_then(normalize_sqlite_ts_value);
+                let updated = session
+                    .time_updated_raw
+                    .as_ref()
+                    .and_then(normalize_sqlite_ts_value);
+                if let Some(since) = since_ts
+                    && updated.is_some_and(|ts| ts < since)
+                {
+                    continue;
+                }
+                let (v2_row_count, messages) =
+                    load_v2_session_messages(&mut v2_msg_stmt, &session.id)?;
+                // Do not claim an empty v2 session: the legacy loader below is
+                // the per-session fallback for partially migrated databases.
+                if v2_row_count == 0 {
+                    continue;
+                }
+                if !seen_ids.insert(session.id.clone()) {
+                    continue;
+                }
+                if messages.is_empty() {
+                    continue;
+                }
+                let msg_started = messages.iter().filter_map(|m| m.created_at).min();
+                let msg_ended = messages.iter().filter_map(|m| m.created_at).max();
+                let started_at = created.or(msg_started);
+                let ended_at = updated.or(msg_ended).or(started_at);
+                if since_ts.is_some_and(|since| ended_at.or(started_at).unwrap_or(0) < since) {
+                    continue;
+                }
+                let title = session.title.or_else(|| {
+                    messages.first().and_then(|m| {
+                        m.content
+                            .lines()
+                            .next()
+                            .map(|s| s.chars().take(100).collect())
+                    })
+                });
+                on_conversation(NormalizedConversation {
+                    agent_slug: "opencode".into(),
+                    external_id: Some(session.id.clone()),
+                    title,
+                    workspace: session.directory.map(PathBuf::from),
+                    source_path: db_path.join(urlencoding::encode(&session.id).as_ref()),
+                    started_at,
+                    ended_at,
+                    metadata: serde_json::json!({
+                        "session_id": session.id,
+                        "project_id": session.project_id,
+                        "version": session.version.as_ref().map(sqlite_value_to_json),
+                        "parent_id": session.parent_id,
+                        "source": "sqlite-v2",
+                    }),
+                    messages,
+                    ..Default::default()
+                })?;
+            }
+        }
 
         warn_on_opencode_schema_drift(&conn, db_path);
 
         // Per-session statements, prepared once and reused. Both are scoped by
         // session_id (indexed by message_session_time_created_id_idx and
         // part_session_idx), so each fetches only one session's rows.
+        if !has_table(&conn, "message") || !has_table(&conn, "part") {
+            return Ok(());
+        }
         let mut msg_stmt = conn
             .prepare(
                 "SELECT id, data, time_created FROM message
@@ -760,6 +862,17 @@ struct SqliteSession {
     project_id: Option<String>,
     time_created_raw: Option<SqliteValue>,
     time_updated_raw: Option<SqliteValue>,
+}
+
+struct SqliteV2Session {
+    id: String,
+    title: Option<String>,
+    directory: Option<String>,
+    project_id: Option<String>,
+    time_created_raw: Option<SqliteValue>,
+    time_updated_raw: Option<SqliteValue>,
+    version: Option<SqliteValue>,
+    parent_id: Option<String>,
 }
 
 /// Deserialized message.data JSON from SQLite.
@@ -1164,6 +1277,189 @@ fn count_known_table_rows(conn: &Connection, table: OpenCodeRowCount) -> Option<
     conn.query_row(count_sql, [], |r| r.get(0)).ok()
 }
 
+fn has_opencode_v2_tables(conn: &Connection) -> bool {
+    has_table(conn, "session_v2")
+        && has_table(conn, "session_message")
+        && count_known_table_rows(conn, OpenCodeRowCount::SessionMessage).unwrap_or(0) > 0
+}
+
+fn has_table(conn: &Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+fn load_v2_session_messages(
+    stmt: &mut rusqlite::Statement<'_>,
+    session_id: &str,
+) -> Result<(usize, Vec<NormalizedMessage>)> {
+    let mut messages = Vec::new();
+    let mut row_count = 0;
+    let mut rows = stmt.query([session_id])?;
+    while let Some(row) = rows.next()? {
+        row_count += 1;
+        let id: String = row.get(0)?;
+        let seq: i64 = row.get(1)?;
+        let kind: String = row.get(2)?;
+        let data: String = row.get(3)?;
+        let value: serde_json::Value = match serde_json::from_str(&data) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::debug!("opencode v2: failed to parse message {id}: {error}");
+                continue;
+            }
+        };
+        let (role, author, content) = match kind.as_str() {
+            "user" => ("user", Some("user".to_string()), v2_text(&value)),
+            "assistant" => {
+                let author = v2_model_author(&value);
+                ("assistant", author, v2_assistant_content(&value))
+            }
+            "synthetic" | "system" | "compaction" => ("system", None, v2_text_or_summary(&value)),
+            // These are state/control events, not conversation content.
+            _ => continue,
+        };
+        if content.trim().is_empty() {
+            continue;
+        }
+        let created_at = value
+            .get("time")
+            .and_then(|time| time.get("created"))
+            .and_then(serde_json::Value::as_i64)
+            .or_else(|| value.get("created_at").and_then(serde_json::Value::as_i64))
+            .and_then(|ts| normalize_opencode_timestamp(Some(ts)));
+        messages.push((
+            seq,
+            NormalizedMessage {
+                idx: 0,
+                role: role.to_string(),
+                author,
+                created_at,
+                content,
+                extra: serde_json::json!({
+                    "message_id": id,
+                    "session_id": session_id,
+                    "seq": seq,
+                    "type": kind,
+                }),
+                invocations: Vec::new(),
+                snippets: Vec::new(),
+                ..Default::default()
+            },
+        ));
+    }
+    messages.sort_by_key(|(seq, _)| *seq);
+    let mut messages: Vec<_> = messages.into_iter().map(|(_, message)| message).collect();
+    crate::types::reindex_messages(&mut messages);
+    Ok((row_count, messages))
+}
+
+fn v2_text(value: &serde_json::Value) -> String {
+    value
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn v2_text_or_summary(value: &serde_json::Value) -> String {
+    value
+        .get("text")
+        .or_else(|| value.get("summary"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn v2_model_author(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("modelID")
+        .or_else(|| value.get("model_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            let model = value.get("model")?;
+            let provider = model
+                .get("providerID")
+                .or_else(|| model.get("provider_id"))?
+                .as_str()?;
+            let id = model.get("id").and_then(serde_json::Value::as_str);
+            Some(id.map_or_else(|| provider.to_string(), |id| format!("{provider}/{id}")))
+        })
+        .or_else(|| {
+            value
+                .get("providerID")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn v2_assistant_content(value: &serde_json::Value) -> String {
+    let Some(content) = value.get("content").and_then(serde_json::Value::as_array) else {
+        return v2_text(value);
+    };
+    let mut pieces = Vec::new();
+    for item in content {
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => {
+                if let Some(text) = item.get("text").and_then(serde_json::Value::as_str)
+                    && !text.trim().is_empty()
+                {
+                    pieces.push(cap_part_body(text));
+                }
+            }
+            Some("tool") => {
+                let name = item
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool");
+                let state = item.get("state");
+                let input = state.and_then(|s| s.get("input")).map(compact_json);
+                let mut tool = format!("[Tool: {name}]");
+                if let Some(input) = input.filter(|text| !text.is_empty()) {
+                    let _ = write!(tool, "\nInput: {input}");
+                }
+                if let Some(text) = state
+                    .and_then(|s| s.get("content"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|entry| {
+                                entry.get("text").and_then(serde_json::Value::as_str)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .filter(|text| !text.is_empty())
+                {
+                    let _ = write!(tool, "\n{text}");
+                }
+                if let Some(output) = state
+                    .and_then(|s| s.get("output"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let _ = write!(tool, "\nOutput: {output}");
+                }
+                pieces.push(tool);
+            }
+            // Reasoning is intentionally excluded by the content policy.
+            _ => {}
+        }
+    }
+    pieces.join("\n\n")
+}
+
+fn compact_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        _ => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
 /// Warn loudly when the `message`/`part` tables this connector reads are empty
 /// but the newer `session_message` table is populated — i.e. OpenCode migrated
 /// to a schema this connector does not yet read. Without this, the scan would
@@ -1203,6 +1499,16 @@ fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
     match row.get::<_, SqliteValue>(index) {
         Ok(SqliteValue::Null) | Err(_) => None,
         Ok(value) => Some(value),
+    }
+}
+
+fn sqlite_value_to_json(value: &SqliteValue) -> serde_json::Value {
+    match value {
+        SqliteValue::Null => serde_json::Value::Null,
+        SqliteValue::Integer(value) => serde_json::json!(*value),
+        SqliteValue::Real(value) => serde_json::json!(*value),
+        SqliteValue::Text(value) => serde_json::json!(value),
+        SqliteValue::Blob(_) => serde_json::Value::Null,
     }
 }
 
@@ -3153,6 +3459,151 @@ mod tests {
         .unwrap();
 
         db_path
+    }
+
+    fn create_test_v2_tables(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (
+                id TEXT PRIMARY KEY, title TEXT, directory TEXT, project_id TEXT,
+                time_created INTEGER, time_updated INTEGER, version INTEGER, parent_id TEXT
+            );
+            CREATE TABLE session_message (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+                type TEXT NOT NULL, data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sqlite_extract_v2_only_assembles_policy_content() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = open_test_connection(&db_path);
+        create_test_v2_tables(&conn);
+        conn.execute(
+            "INSERT INTO session_v2 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                "v2-only",
+                "V2 title",
+                "/work/v2",
+                "project-v2",
+                1_700_000_000_i64,
+                1_700_000_100_i64,
+                2_i64,
+                "parent"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["m-user", "v2-only", 0_i64, "user", r#"{"text":"Question"}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["m-assistant", "v2-only", 1_i64, "assistant", r#"{"model":{"providerID":"openai","id":"gpt-5"},"content":[{"type":"text","text":"Answer"},{"type":"reasoning","text":"SECRET"},{"type":"tool","name":"grep","state":{"input":{"pattern":"x"},"content":[{"text":"match"}],"output":"done"}}]}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["m-idle", "v2-only", 2_i64, "idle", r#"{"text":"ignored"}"#],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        let conversation = &convs[0];
+        assert_eq!(conversation.external_id.as_deref(), Some("v2-only"));
+        assert_eq!(conversation.metadata["version"], 2);
+        assert_eq!(conversation.metadata["parent_id"], "parent");
+        assert_eq!(conversation.messages.len(), 2);
+        assert_eq!(conversation.messages[0].role, "user");
+        assert_eq!(
+            conversation.messages[1].author.as_deref(),
+            Some("openai/gpt-5")
+        );
+        assert!(conversation.messages[1].content.contains("Answer"));
+        assert!(conversation.messages[1].content.contains("[Tool: grep]"));
+        assert!(conversation.messages[1].content.contains("match"));
+        assert!(!conversation.messages[1].content.contains("SECRET"));
+        assert_eq!(conversation.source_path, db_path.join("v2-only"));
+    }
+
+    #[test]
+    fn sqlite_extract_v2_and_legacy_use_per_session_fallback() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        let conn = open_test_connection(&db_path);
+        create_test_v2_tables(&conn);
+        // This session is represented in both stores: v2 must win.
+        conn.execute(
+            "INSERT INTO session_v2 (id, title, version) VALUES (?1, ?2, ?3)",
+            params!["both", "V2", 2_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["v2-m", "both", 0_i64, "user", r#"{"text":"v2 content"}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["both", "Legacy"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["legacy-b", "both", r#"{"role":"user"}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "part-b",
+                "legacy-b",
+                "both",
+                r#"{"type":"text","text":"legacy duplicate"}"#
+            ],
+        )
+        .unwrap();
+        // This session has no v2 rows and must still use legacy storage.
+        conn.execute(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["legacy-only", "Legacy only"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params!["legacy-l", "legacy-only", r#"{"role":"user"}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "part-l",
+                "legacy-l",
+                "legacy-only",
+                r#"{"type":"text","text":"legacy retained"}"#
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None).unwrap();
+        assert_eq!(convs.len(), 2);
+        let both = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some("both"))
+            .unwrap();
+        assert_eq!(both.messages.len(), 1);
+        assert_eq!(both.messages[0].content, "v2 content");
+        let legacy = convs
+            .iter()
+            .find(|c| c.external_id.as_deref() == Some("legacy-only"))
+            .unwrap();
+        assert_eq!(legacy.messages[0].content, "legacy retained");
     }
 
     #[test]
