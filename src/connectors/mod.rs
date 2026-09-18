@@ -11,7 +11,7 @@ pub mod chatgpt;
 pub mod claude_code;
 pub mod clawdbot;
 pub mod cline;
-#[cfg(all(feature = "codebuff", feature = "upstream-extras"))]
+#[cfg(feature = "codebuff")]
 pub mod codebuff;
 pub mod codex;
 pub mod copilot;
@@ -30,7 +30,7 @@ pub mod gemini;
 pub mod goose;
 #[cfg(feature = "upstream-extras")]
 pub mod grok;
-#[cfg(all(feature = "grok-bot", feature = "upstream-extras"))]
+#[cfg(feature = "grok-bot")]
 pub mod grok_bot;
 #[cfg(feature = "hermes")]
 pub mod hermes;
@@ -324,9 +324,9 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         #[cfg(feature = "devin")]
         ("devin", || Box::new(devin::DevinConnector::new())),
     ];
-    #[cfg(all(feature = "grok-bot", feature = "upstream-extras"))]
+    #[cfg(feature = "grok-bot")]
     v.push(("grok_bot", || Box::new(grok_bot::GrokBotConnector::new())));
-    #[cfg(all(feature = "codebuff", feature = "upstream-extras"))]
+    #[cfg(feature = "codebuff")]
     v.push(("codebuff", || Box::new(codebuff::CodebuffConnector::new())));
     #[cfg(feature = "opencode")]
     v.push(("opencode", || Box::new(opencode::OpenCodeConnector::new())));

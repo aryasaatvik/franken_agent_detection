@@ -60,6 +60,9 @@ use super::{
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
+#[cfg(feature = "copilot-vscdb")]
+use super::copilot_vscode;
+
 pub struct CopilotConnector;
 
 impl Default for CopilotConnector {
@@ -344,6 +347,20 @@ impl CopilotConnector {
         roots
     }
 
+    #[cfg(feature = "copilot-vscdb")]
+    fn native_source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
+        if !ctx.scan_roots.is_empty() {
+            return ctx.scan_roots.clone();
+        }
+        if !ctx.data_dir.as_os_str().is_empty() {
+            return vec![ScanRoot::local(ctx.data_dir.clone())];
+        }
+        copilot_vscode::default_user_roots()
+            .into_iter()
+            .map(ScanRoot::local)
+            .collect()
+    }
+
     fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
         let mut out = Vec::new();
         for root in Self::source_roots(ctx) {
@@ -364,6 +381,11 @@ impl CopilotConnector {
                 );
             }
         }
+        #[cfg(feature = "copilot-vscdb")]
+        out.extend(copilot_vscode::discover_native(
+            &Self::native_source_roots(ctx),
+            ctx.since_ts,
+        ));
         out
     }
 
@@ -1057,10 +1079,6 @@ impl Connector for CopilotConnector {
             .map(|root| root.path)
             .collect();
 
-        if roots.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut all_conversations = Vec::new();
 
         for root in roots {
@@ -1102,6 +1120,12 @@ impl Connector for CopilotConnector {
                 }
             }
         }
+
+        #[cfg(feature = "copilot-vscdb")]
+        all_conversations.extend(copilot_vscode::scan_native(
+            &Self::native_source_roots(ctx),
+            ctx.since_ts,
+        ));
 
         Ok(all_conversations)
     }

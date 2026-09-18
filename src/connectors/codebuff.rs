@@ -271,6 +271,7 @@ fn parse_session(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
             extra,
             snippets: Vec::new(),
             invocations,
+            ..Default::default()
         });
     }
     if messages.is_empty() {
@@ -290,6 +291,7 @@ fn parse_session(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
         ended_at: messages.iter().filter_map(|m| m.created_at).max(),
         metadata,
         messages,
+        ..Default::default()
     }))
 }
 

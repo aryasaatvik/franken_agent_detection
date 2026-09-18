@@ -73,7 +73,7 @@ copilot-vscdb = ["connectors", "dep:rusqlite"]
 # production all-connectors profile until that pass is complete.
 upstream-extras = ["connectors", "codebuff", "grok-bot"]
 # All connectors enabled
-all-connectors = ["connectors", "chatgpt", "cursor", "devin", "antigravity", "opencode", "goose", "hermes", "crush", "shelley", "copilot-vscdb"]
+all-connectors = ["connectors", "chatgpt", "cursor", "devin", "antigravity", "opencode", "goose", "hermes", "crush", "shelley", "copilot-vscdb", "codebuff", "grok-bot"]
 
 [dev-dependencies]
 tempfile = "3"

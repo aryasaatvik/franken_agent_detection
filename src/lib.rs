@@ -2142,17 +2142,11 @@ mod tests {
             let detection_only: HashSet<&str> = HashSet::from(["continue", "windsurf"]);
             let feature_gated: HashMap<&str, bool> = HashMap::from([
                 ("chatgpt", cfg!(feature = "chatgpt")),
-                (
-                    "codebuff",
-                    cfg!(all(feature = "codebuff", feature = "upstream-extras")),
-                ),
+                ("codebuff", cfg!(feature = "codebuff")),
                 ("crush", cfg!(feature = "crush")),
                 ("cursor", cfg!(feature = "cursor")),
                 ("goose", cfg!(feature = "goose")),
-                (
-                    "grok_bot",
-                    cfg!(all(feature = "grok-bot", feature = "upstream-extras")),
-                ),
+                ("grok_bot", cfg!(feature = "grok-bot")),
                 ("hermes", cfg!(feature = "hermes")),
                 ("opencode", cfg!(feature = "opencode")),
                 ("shelley", cfg!(feature = "shelley")),

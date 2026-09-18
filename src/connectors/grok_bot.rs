@@ -222,6 +222,7 @@ fn parse_replica(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
             extra,
             snippets: Vec::new(),
             invocations: Vec::new(),
+            ..Default::default()
         });
     }
     if messages.is_empty() {
@@ -239,12 +240,13 @@ fn parse_replica(source: &DiscoveredSourceFile) -> Result<Option<NormalizedConve
         started_at: messages.iter().filter_map(|m| m.created_at).min(),
         ended_at: messages.iter().filter_map(|m| m.created_at).max(),
         metadata: json!({
-            "history_kind": "rolling_agent_transcript", "history_complete": false,
-            "chat_only": true, "observed_entry_cap": 200, "source_entry_count": entries.len(),
-            "schema_version": 1, "source_id": source.origin.source_id,
-            "missing_entry_id_count": missing_entry_id_count,
+        "history_kind": "rolling_agent_transcript", "history_complete": false,
+        "chat_only": true, "observed_entry_cap": 200, "source_entry_count": entries.len(),
+        "schema_version": 1, "source_id": source.origin.source_id,
+        "missing_entry_id_count": missing_entry_id_count,
         }),
         messages,
+        ..Default::default()
     }))
 }
 
@@ -351,6 +353,7 @@ mod tests {
             scan_roots: vec![ScanRoot::local(root.to_path_buf())],
             since_ts,
             progress_tick: None,
+            include_archived_sessions: false,
         }
     }
 

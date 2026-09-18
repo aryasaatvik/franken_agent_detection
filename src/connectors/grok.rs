@@ -1071,6 +1071,7 @@ mod tests {
             scan_roots: vec![ScanRoot::local(root.to_path_buf())],
             since_ts: None,
             progress_tick: None,
+            include_archived_sessions: false,
         }
     }
 
