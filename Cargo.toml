@@ -31,6 +31,8 @@ urlencoding = { version = "2", optional = true }
 # --- Optional: ChatGPT encrypted conversations ---
 aes-gcm = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
+blake3 = { version = "1", optional = true }
+url = { version = "2", optional = true }
 
 # --- Optional: SQLite-backed session databases ---
 rusqlite = { version = "0.39", features = ["bundled"], optional = true }
@@ -59,8 +61,14 @@ goose = ["connectors", "dep:rusqlite", "dep:urlencoding"]
 hermes = ["connectors", "dep:rusqlite", "dep:urlencoding"]
 # Crush: SQLite database access for Charm's Crush agent
 crush = ["connectors", "dep:rusqlite"]
+devin = ["connectors", "dep:rusqlite", "dep:urlencoding"]
+grok-bot = ["connectors"]
+codebuff = ["connectors"]
+shelley = ["connectors", "dep:rusqlite", "dep:blake3", "dep:base64", "dep:url"]
+openclaw-sqlite = ["connectors", "dep:rusqlite"]
+copilot-vscdb = ["connectors", "dep:rusqlite"]
 # All connectors enabled
-all-connectors = ["connectors", "chatgpt", "cursor", "opencode", "goose", "hermes", "crush"]
+all-connectors = ["connectors", "chatgpt", "codebuff", "cursor", "devin", "opencode", "goose", "grok-bot", "hermes", "crush", "shelley", "openclaw-sqlite", "copilot-vscdb"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -75,3 +83,4 @@ nursery = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+assert_is_empty = "allow"

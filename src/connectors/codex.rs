@@ -977,7 +977,12 @@ mod tests {
         let ctx = ScanContext::local_default(codex_dir.clone(), None);
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1, "archived must be excluded by default");
-        assert!(convs[0].messages.iter().any(|m| m.content == "active session"));
+        assert!(
+            convs[0]
+                .messages
+                .iter()
+                .any(|m| m.content == "active session")
+        );
 
         // Opt-in: archived included alongside active.
         let mut ctx = ScanContext::local_default(codex_dir.clone(), None);
@@ -1003,7 +1008,10 @@ mod tests {
         let active_id = id_for("active session");
         let archived_id = id_for("archived session");
         assert_eq!(active_id.as_deref(), Some("rollout-dup"));
-        assert_eq!(archived_id.as_deref(), Some("archived_sessions/rollout-dup"));
+        assert_eq!(
+            archived_id.as_deref(),
+            Some("archived_sessions/rollout-dup")
+        );
         assert_ne!(
             active_id, archived_id,
             "same-name rollouts in different stores must get distinct external_ids"

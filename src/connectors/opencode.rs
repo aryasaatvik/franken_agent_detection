@@ -4164,8 +4164,15 @@ mod tests {
         // Scan: the DB is authoritative, so the legacy-only session is not
         // re-indexed from files.
         let convs = connector.scan(&ctx).unwrap();
-        let ids: Vec<&str> = convs.iter().filter_map(|c| c.external_id.as_deref()).collect();
-        assert_eq!(ids, vec!["sess-db"], "only the DB session should be scanned");
+        let ids: Vec<&str> = convs
+            .iter()
+            .filter_map(|c| c.external_id.as_deref())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["sess-db"],
+            "only the DB session should be scanned"
+        );
     }
 
     /// Incremental edge case: the DB is read cleanly but `since_ts` filters out
