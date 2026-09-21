@@ -230,6 +230,45 @@ impl OpenCodeConnector {
         }
     }
 
+    /// Host OpenCode databases (`~/.local/share/opencode/opencode.db` and the
+    /// other `sqlite_db_candidates`) are consulted for a default scan unless
+    /// `data_dir` is already a closed fixture.
+    ///
+    /// cass always passes its own data directory. That path is not an OpenCode
+    /// store, so treating every non-empty `data_dir` as hermetic hid the real
+    /// database from `cass index` and `cass index --full`. Explicit scan roots,
+    /// a `.db` path, a directory that already contains `opencode.db`, and a
+    /// legacy `session/`+`message/` tree stay closed so fixture tests do not
+    /// also read the host database.
+    fn should_probe_default_sqlite_locations(ctx: &ScanContext) -> bool {
+        if !ctx.use_default_detection() {
+            return false;
+        }
+        if ctx.data_dir.as_os_str().is_empty() {
+            return true;
+        }
+        if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
+            return false;
+        }
+        if ctx.data_dir.join("opencode.db").is_file() {
+            return false;
+        }
+        if looks_like_opencode_storage(&ctx.data_dir) {
+            return false;
+        }
+        true
+    }
+
+    fn append_default_sqlite_candidates(
+        ctx: &ScanContext,
+        host_candidates: impl IntoIterator<Item = PathBuf>,
+        out: &mut Vec<PathBuf>,
+    ) {
+        if Self::should_probe_default_sqlite_locations(ctx) {
+            out.extend(host_candidates);
+        }
+    }
+
     fn sqlite_source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut db_candidates: Vec<ScanRoot> = Vec::new();
         if ctx.data_dir.extension().is_some_and(|ext| ext == "db") {
@@ -246,13 +285,13 @@ impl OpenCodeConnector {
             }
         }
 
-        if ctx.data_dir.as_os_str().is_empty() && ctx.scan_roots.is_empty() {
-            db_candidates.extend(
-                Self::sqlite_db_candidates()
-                    .into_iter()
-                    .map(ScanRoot::local),
-            );
-        }
+        let mut host_candidates = Vec::new();
+        Self::append_default_sqlite_candidates(
+            ctx,
+            Self::sqlite_db_candidates(),
+            &mut host_candidates,
+        );
+        db_candidates.extend(host_candidates.into_iter().map(ScanRoot::local));
 
         let mut seen = HashSet::new();
         db_candidates.retain(|root| seen.insert(root.path.clone()));
@@ -1017,9 +1056,12 @@ impl Connector for OpenCodeConnector {
         //      (has a `.db` extension), use it as-is.
         //   2. Otherwise, if ctx.data_dir is non-empty, treat it as a
         //      directory and check for `<data_dir>/opencode.db`.
-        //   3. Always add the built-in default search list. This ensures
-        //      we find the canonical XDG location even when explicit scan
-        //      roots or a stale detection path were passed in (see issue #174).
+        //   3. Probe the host default list unless this context is a closed
+        //      fixture (an explicit scan root, a `.db` path, a directory that
+        //      already contains `opencode.db`, or a legacy storage tree).
+        //      cass passes its own data directory here; that directory is not
+        //      an OpenCode store, and skipping the host list hides
+        //      `~/.local/share/opencode/opencode.db` from `cass index`.
         //
         // Non-existence of any candidate is filtered at iteration time
         // (`if !db.exists() { continue; }` below), so we do not gate the
@@ -1040,12 +1082,11 @@ impl Connector for OpenCodeConnector {
             }
         }
 
-        // A non-empty explicit data directory is already a hermetic source
-        // boundary (and is how connector tests provide fixtures). Only probe
-        // the host's default locations for the empty/default context.
-        if ctx.data_dir.as_os_str().is_empty() && ctx.scan_roots.is_empty() {
-            db_candidates.extend(Self::sqlite_db_candidates());
-        }
+        Self::append_default_sqlite_candidates(
+            ctx,
+            Self::sqlite_db_candidates(),
+            &mut db_candidates,
+        );
 
         // Deduplicate while preserving priority order.
         {
@@ -4229,6 +4270,56 @@ mod tests {
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-parent"));
+    }
+
+    /// cass passes its own data directory. That path is not an OpenCode store,
+    /// so the host database must stay in the candidate list. A directory that
+    /// already contains `opencode.db`, or a legacy storage tree, stays closed.
+    #[test]
+    fn unrelated_data_dir_keeps_host_opencode_db_in_the_candidate_list() {
+        let cass_dir = TempDir::new().unwrap();
+        std::fs::write(cass_dir.path().join("agent_search.db"), b"not opencode").unwrap();
+        let host_db = PathBuf::from("/home/user/.local/share/opencode/opencode.db");
+        let ctx = ScanContext::local_default(cass_dir.path().to_path_buf(), None);
+        let mut candidates = vec![cass_dir.path().join("opencode.db")];
+        OpenCodeConnector::append_default_sqlite_candidates(
+            &ctx,
+            [host_db.clone()],
+            &mut candidates,
+        );
+        assert!(
+            candidates.iter().any(|path| path == &host_db),
+            "cass data dir must not hide the host OpenCode database"
+        );
+
+        let fixture = TempDir::new().unwrap();
+        let _fixture_db = create_test_sqlite_db(fixture.path());
+        let fixture_ctx = ScanContext::local_default(fixture.path().to_path_buf(), None);
+        let mut fixture_candidates = vec![fixture.path().join("opencode.db")];
+        OpenCodeConnector::append_default_sqlite_candidates(
+            &fixture_ctx,
+            [host_db.clone()],
+            &mut fixture_candidates,
+        );
+        assert!(
+            !fixture_candidates.iter().any(|path| path == &host_db),
+            "a fixture that already contains opencode.db must stay hermetic"
+        );
+
+        let storage = TempDir::new().unwrap();
+        std::fs::create_dir(storage.path().join("session")).unwrap();
+        std::fs::create_dir(storage.path().join("message")).unwrap();
+        let storage_ctx = ScanContext::local_default(storage.path().to_path_buf(), None);
+        let mut storage_candidates = Vec::new();
+        OpenCodeConnector::append_default_sqlite_candidates(
+            &storage_ctx,
+            [host_db.clone()],
+            &mut storage_candidates,
+        );
+        assert!(
+            storage_candidates.is_empty(),
+            "a legacy storage fixture must not also open the host database"
+        );
     }
 
     /// Regression for issue #174: when the caller passes an explicit
