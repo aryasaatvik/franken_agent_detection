@@ -929,7 +929,15 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
         }
         "t3" => {
             if let Some(base) = std::env::var_os("T3CODE_HOME").filter(|value| !value.is_empty()) {
-                out.push(PathBuf::from(base).join("userdata/statev2.sqlite"));
+                let base =
+                    expand_leading_tilde(&base.to_string_lossy(), dirs::home_dir().as_deref());
+                for layout in [
+                    "statev2.sqlite",
+                    "userdata/statev2.sqlite",
+                    "dev/statev2.sqlite",
+                ] {
+                    out.push(base.join(layout));
+                }
             }
             maybe_push(&mut out, &[".t3", "userdata", "statev2.sqlite"]);
             maybe_push(&mut out, &[".t3", "dev", "statev2.sqlite"]);

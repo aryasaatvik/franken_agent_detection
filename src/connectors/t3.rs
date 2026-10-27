@@ -189,8 +189,9 @@ impl Connector for T3Connector {
     ) -> Result<()> {
         for root in Self::databases(ctx) {
             let mut connection = open_database(&root.path)?;
-            let transaction = connection.transaction()?;
-            let mut statement = transaction.prepare(
+            let ids = {
+                let transaction = connection.transaction()?;
+                let mut statement = transaction.prepare(
                 "SELECT thread_id FROM orchestration_v2_projection_threads AS thread
                  WHERE deleted_at IS NULL AND (
                    ?1 IS NULL OR unixepoch(updated_at, 'subsec') * 1000 >= ?1
@@ -203,15 +204,22 @@ impl Connector for T3Connector {
                      WHERE provider.thread_id=thread.thread_id AND unixepoch(provider.updated_at, 'subsec') * 1000 >= ?1)
                  ) ORDER BY thread_id"
             )?;
-            let mut rows = statement.query([ctx.since_ts])?;
-            while let Some(row) = rows.next()? {
-                let id: String = row.get(0)?;
+                statement
+                    .query_map([ctx.since_ts], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for id in ids {
                 if let Some(tick) = &ctx.progress_tick {
                     tick();
                 }
-                let projection = Projection::read(&transaction, &id)?;
-                let visible = visible_items(&transaction, &projection, &mut HashSet::new())?;
-                emit(conversation(&transaction, &root, &projection, visible)?)?;
+                let snapshot = {
+                    let transaction = connection.transaction()?;
+                    let projection = Projection::read(&transaction, &id)?;
+                    let visible = visible_items(&transaction, &projection, &mut HashSet::new())?;
+                    conversation(&transaction, &root, &projection, visible)?
+                };
+                // Consumer backpressure must not pin the live application's WAL.
+                emit(snapshot)?;
             }
         }
         Ok(())
@@ -366,6 +374,42 @@ mod tests {
     }
 
     #[test]
+    fn t3_message_only_notices_keep_their_chronological_position() {
+        let (_directory, writer, path) = fixture();
+        thread(&writer, "thread", Value::Null, false);
+        item(
+            &writer,
+            "thread",
+            "first",
+            0,
+            "user_message",
+            "firstword",
+            None,
+        );
+        item(
+            &writer,
+            "thread",
+            "last",
+            1,
+            "assistant_message",
+            "lastword",
+            None,
+        );
+        writer.execute("UPDATE orchestration_v2_projection_turn_items SET payload_json=json_set(payload_json,'$.startedAt','2026-10-27T10:00:02.000Z') WHERE turn_item_id='last'",[]).expect("later turn");
+        let notice = json!({"id":"notice","threadId":"thread","role":"system","text":"middleword","createdAt":"2026-10-27T10:00:01.000Z","updatedAt":AT});
+        writer.execute("INSERT INTO orchestration_v2_projection_messages VALUES('notice','thread',?1,?1,?2)",rusqlite::params![AT,notice.to_string()]).expect("notice");
+        let loaded = T3Connector::load_thread(&path, "thread").expect("ordered notices");
+        assert_eq!(
+            loaded
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["firstword", "middleword", "lastword"]
+        );
+    }
+
+    #[test]
     fn t3_fork_prefix_stops_at_source_run_and_filters_local_rollbacks() {
         let (_directory, writer, path) = fixture();
         thread(&writer, "parent", Value::Null, false);
@@ -425,6 +469,22 @@ mod tests {
         assert!(!contents.contains(&"futureword"));
         assert!(!contents.contains(&"hiddenword"));
         assert_eq!(loaded.lineage_relation, Some(LineageRelation::Fork));
+        writer.execute("UPDATE orchestration_v2_projection_turn_items SET payload_json=json_set(payload_json,'$.messageId','parent-message') WHERE turn_item_id='included'",[]).expect("reference parent message");
+        let current = json!({"id":"parent-message","threadId":"parent","role":"user","text":"completedprefix","createdAt":AT,"updatedAt":AT});
+        writer.execute("INSERT INTO orchestration_v2_projection_messages VALUES('parent-message','parent',?1,?1,?2)",rusqlite::params![AT,current.to_string()]).expect("parent message");
+        let loaded = T3Connector::load_thread(&path, "child").expect("completed fork");
+        assert!(
+            loaded
+                .messages
+                .iter()
+                .any(|message| message.content == "completedprefix")
+        );
+        assert!(
+            !loaded
+                .messages
+                .iter()
+                .any(|message| message.content == "prefixword")
+        );
     }
 
     #[test]
@@ -465,6 +525,17 @@ mod tests {
         );
         thread(&writer, "thread", Value::Null, false);
         item(&writer, "thread", "item", 0, "user_message", "word", None);
+        connector
+            .scan_with_callback(&context(&path, None), &mut |_| {
+                let busy: i64 =
+                    writer.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+                assert_eq!(
+                    busy, 0,
+                    "consumer callback must run after the source read transaction ends"
+                );
+                Ok(())
+            })
+            .expect("checkpoint from callback");
         assert!(
             connector
                 .scan_with_callback(&context(&path, None), &mut |_| anyhow::bail!(
@@ -813,6 +884,15 @@ impl Projection {
 
     fn annotated_item(&self, item: &Value) -> Value {
         let mut item = item.clone();
+        if let Some(message) = text(&item, "messageId").and_then(|id| {
+            self.messages
+                .iter()
+                .find(|message| text(message, "id") == Some(id))
+        }) {
+            item["text"] = message["text"].clone();
+            item["attachments"] = message["attachments"].clone();
+            item["streaming"] = message["streaming"].clone();
+        }
         let run = text(&item, "runId")
             .and_then(|id| self.runs.iter().find(|run| text(run, "id") == Some(id)));
         let provider_id = text(&item, "providerThreadId")
@@ -914,7 +994,24 @@ fn visible_items(
                 Some("assistant") => "assistant_message",
                 _ => "system_notice",
             });
-            visible.push(item);
+            let created_at = timestamp(message, "createdAt")?;
+            let mut position = visible.len();
+            for (index, candidate) in visible.iter().enumerate() {
+                if text(candidate, "threadId") != Some(id) {
+                    continue;
+                }
+                let candidate_at = timestamp(candidate, "startedAt")?
+                    .or(timestamp(candidate, "createdAt")?)
+                    .or(timestamp(candidate, "updatedAt")?);
+                if created_at
+                    .zip(candidate_at)
+                    .is_some_and(|(notice, turn)| notice < turn)
+                {
+                    position = index;
+                    break;
+                }
+            }
+            visible.insert(position, item);
         }
     }
     seen.remove(id);
