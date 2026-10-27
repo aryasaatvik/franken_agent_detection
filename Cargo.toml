@@ -55,6 +55,7 @@ chatgpt = ["connectors", "dep:aes-gcm", "dep:base64"]
 cursor = ["connectors", "dep:rusqlite", "dep:urlencoding"]
 # OpenCode: SQLite database access for v1.2+ opencode.db
 opencode = ["connectors", "dep:rusqlite", "dep:urlencoding"]
+t3 = ["connectors", "dep:rusqlite", "dep:urlencoding"]
 # Goose: SQLite database access for Goose sessions.db
 goose = ["connectors", "dep:rusqlite", "dep:urlencoding"]
 # Hermes: SQLite database access for Hermes Agent state.db
@@ -73,7 +74,7 @@ copilot-vscdb = ["connectors", "dep:rusqlite"]
 # production all-connectors profile until that pass is complete.
 upstream-extras = ["connectors", "codebuff", "grok-bot"]
 # All connectors enabled
-all-connectors = ["connectors", "chatgpt", "cursor", "devin", "antigravity", "opencode", "goose", "hermes", "crush", "shelley", "copilot-vscdb", "codebuff", "grok-bot"]
+all-connectors = ["connectors", "chatgpt", "cursor", "devin", "antigravity", "opencode", "t3", "goose", "hermes", "crush", "shelley", "copilot-vscdb", "codebuff", "grok-bot"]
 
 [dev-dependencies]
 tempfile = "3"

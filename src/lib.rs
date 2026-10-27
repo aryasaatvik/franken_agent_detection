@@ -56,6 +56,8 @@ pub use connectors::hermes::HermesConnector;
 pub use connectors::opencode::OpenCodeConnector;
 #[cfg(feature = "shelley")]
 pub use connectors::shelley::ShelleyConnector;
+#[cfg(feature = "t3")]
+pub use connectors::t3::T3Connector;
 #[cfg(feature = "connectors")]
 pub use connectors::token_extraction::{ExtractedTokenUsage, ModelInfo, TokenDataSource};
 #[cfg(feature = "connectors")]
@@ -166,6 +168,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "prime_agent",
     "qwen",
     "shelley",
+    "t3",
     "vibe",
     "windsurf",
 ];
@@ -203,6 +206,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "pi_agent" | "pi-agent" | "piagent" => Some("pi_agent"),
         "prime_agent" | "prime-agent" | "primeagent" => Some("prime_agent"),
         "qwen" | "qwen-code" | "qwen-cli" => Some("qwen"),
+        "t3" | "t3code" | "t3-code" => Some("t3"),
         "shelley" | "shelley-db" => Some("shelley"),
         "vibe" | "vibe-cli" => Some("vibe"),
         "windsurf" => Some("windsurf"),
@@ -923,6 +927,21 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             }
             maybe_push(&mut out, &["shelley.db"]);
         }
+        "t3" => {
+            if let Some(base) = std::env::var_os("T3CODE_HOME").filter(|value| !value.is_empty()) {
+                let base =
+                    expand_leading_tilde(&base.to_string_lossy(), dirs::home_dir().as_deref());
+                for layout in [
+                    "statev2.sqlite",
+                    "userdata/statev2.sqlite",
+                    "dev/statev2.sqlite",
+                ] {
+                    out.push(base.join(layout));
+                }
+            }
+            maybe_push(&mut out, &[".t3", "userdata", "statev2.sqlite"]);
+            maybe_push(&mut out, &[".t3", "dev", "statev2.sqlite"]);
+        }
         "qwen" => {
             maybe_push(&mut out, &[".qwen", "tmp"]);
             maybe_push(&mut out, &[".qwen"]);
@@ -1493,7 +1512,7 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                 // consistent bundle yet (cass gh#415). The explicit arm (vs
                 // the wildcard) documents that this emptiness is deliberate.
                 #[allow(clippy::match_same_arms)]
-                "shelley" => vec![],
+                "shelley" | "t3" => vec![],
                 "qwen" => vec![tilde(&[".qwen", "tmp"]), tilde(&[".qwen"])],
                 "vibe" => vec![tilde(&[".vibe", "logs", "session"]), tilde(&[".vibe"])],
                 "windsurf" => vec![tilde(&[".windsurf"]), tilde(&[".config", "windsurf"])],
@@ -2119,7 +2138,7 @@ mod tests {
             // Shelley's arm is intentionally empty: no safe remote
             // export/sync of a live SQLite database exists yet (cass gh#415).
             assert!(
-                !paths.is_empty() || slug == "shelley",
+                !paths.is_empty() || matches!(slug, "shelley" | "t3"),
                 "connector {slug} has empty tilde paths"
             );
         }
@@ -2145,11 +2164,13 @@ mod tests {
                 ("codebuff", cfg!(feature = "codebuff")),
                 ("crush", cfg!(feature = "crush")),
                 ("cursor", cfg!(feature = "cursor")),
+                ("devin", cfg!(feature = "devin")),
                 ("goose", cfg!(feature = "goose")),
                 ("grok_bot", cfg!(feature = "grok-bot")),
                 ("hermes", cfg!(feature = "hermes")),
                 ("opencode", cfg!(feature = "opencode")),
                 ("shelley", cfg!(feature = "shelley")),
+                ("t3", cfg!(feature = "t3")),
                 ("antigravity", cfg!(feature = "antigravity")),
                 ("grok", cfg!(feature = "upstream-extras")),
                 ("kimi", cfg!(feature = "upstream-extras")),

@@ -68,6 +68,8 @@ pub mod shelley;
     feature = "copilot-vscdb"
 ))]
 pub mod sqlite_sync;
+#[cfg(feature = "t3")]
+pub mod t3;
 pub mod token_extraction;
 pub mod utils;
 pub mod vibe;
@@ -330,6 +332,8 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
     v.push(("codebuff", || Box::new(codebuff::CodebuffConnector::new())));
     #[cfg(feature = "opencode")]
     v.push(("opencode", || Box::new(opencode::OpenCodeConnector::new())));
+    #[cfg(feature = "t3")]
+    v.push(("t3", || Box::new(t3::T3Connector::new())));
     #[cfg(feature = "chatgpt")]
     v.push(("chatgpt", || Box::new(chatgpt::ChatGptConnector::new())));
     #[cfg(feature = "cursor")]

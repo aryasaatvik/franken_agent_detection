@@ -331,6 +331,34 @@ pub fn extract_tokens_for_agent(
     let extracted = match agent_slug {
         "claude_code" => extract_claude_code_tokens(extra),
         "codex" => extract_codex_tokens(extra),
+        "t3" => {
+            let model_name = extra
+                .get("model_selection")
+                .and_then(|selection| selection.get("model"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let provider = model_name
+                .as_deref()
+                .map(|model| normalize_model(model).provider);
+            let tool_call_count = u32::from(matches!(
+                extra.get("type").and_then(Value::as_str),
+                Some(
+                    "command_execution"
+                        | "dynamic_tool"
+                        | "file_change"
+                        | "file_search"
+                        | "web_search"
+                        | "subagent"
+                )
+            ));
+            ExtractedTokenUsage {
+                model_name,
+                provider,
+                has_tool_calls: tool_call_count > 0,
+                tool_call_count,
+                ..Default::default()
+            }
+        }
         // Prime Agent assistant messages carry a full usage block
         // (`input`/`output`/`cacheRead`/`cacheWrite`), which the connector
         // preserves under `extra.usage`. Child-usage attribution entries are
@@ -479,6 +507,28 @@ pub fn extract_tokens_for_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn t3_keeps_model_and_tool_identity_without_inventing_api_usage() {
+        let extra =
+            serde_json::json!({"model_selection":{"model":"gpt-6.1-sol"},"type":"dynamic_tool"});
+        let usage = extract_tokens_for_agent("t3", &extra, "persisted tool result", "tool");
+        assert_eq!(usage.model_name.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(usage.provider.as_deref(), Some("openai"));
+        assert_eq!(usage.tool_call_count, 1);
+        assert_eq!(usage.data_source, TokenDataSource::Estimated);
+        let extra = serde_json::json!({"model_selection":{"model":"claude-sonnet-4-6"},"type":"assistant_message"});
+        let usage = extract_tokens_for_agent("t3", &extra, "stored response", "assistant");
+        assert_eq!(usage.provider.as_deref(), Some("anthropic"));
+        assert_eq!(usage.tool_call_count, 0);
+        let usage = extract_tokens_for_agent(
+            "t3",
+            &serde_json::json!({"type":"subagent"}),
+            "child summary",
+            "tool",
+        );
+        assert_eq!(usage.tool_call_count, 1);
+    }
 
     #[test]
     fn normalize_model_claude_opus() {
