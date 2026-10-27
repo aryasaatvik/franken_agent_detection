@@ -253,8 +253,11 @@ mod conformance {
             for (slug, _) in factories {
                 assert!(!slug.is_empty(), "connector slug should not be empty");
                 assert!(
-                    slug.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
-                    "connector slug '{}' should be lowercase with underscores only",
+                    slug.starts_with(|c: char| c.is_ascii_lowercase())
+                        && slug
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                    "connector slug '{}' should start with a lowercase letter and contain lowercase letters, digits, or underscores",
                     slug
                 );
             }
@@ -553,6 +556,7 @@ mod conformance {
             // were dead code and the schema contract gated nothing.
             let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
             let fixtures: &[(&str, &str)] = &[
+                #[cfg(feature = "antigravity")]
                 ("antigravity", "fixtures/antigravity"),
                 ("codex", "fixtures/codex"),
                 ("openhands", "fixtures/openhands"),
