@@ -348,6 +348,7 @@ pub fn extract_tokens_for_agent(
                         | "file_change"
                         | "file_search"
                         | "web_search"
+                        | "subagent"
                 )
             ));
             ExtractedTokenUsage {
@@ -520,6 +521,13 @@ mod tests {
         let usage = extract_tokens_for_agent("t3", &extra, "stored response", "assistant");
         assert_eq!(usage.provider.as_deref(), Some("anthropic"));
         assert_eq!(usage.tool_call_count, 0);
+        let usage = extract_tokens_for_agent(
+            "t3",
+            &serde_json::json!({"type":"subagent"}),
+            "child summary",
+            "tool",
+        );
+        assert_eq!(usage.tool_call_count, 1);
     }
 
     #[test]

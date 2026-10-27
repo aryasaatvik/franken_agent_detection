@@ -214,6 +214,10 @@ impl Connector for T3Connector {
                 }
                 let snapshot = {
                     let transaction = connection.transaction()?;
+                    let active: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id=?1 AND deleted_at IS NULL)",[&id],|row|row.get(0))?;
+                    if !active {
+                        continue;
+                    }
                     let projection = Projection::read(&transaction, &id)?;
                     let visible = visible_items(&transaction, &projection, &mut HashSet::new())?;
                     conversation(&transaction, &root, &projection, visible)?
@@ -407,6 +411,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["firstword", "middleword", "lastword"]
         );
+    }
+
+    #[test]
+    fn t3_skips_threads_deleted_between_consumer_callbacks() {
+        let (_directory, writer, path) = fixture();
+        for id in ["first", "later"] {
+            thread(&writer, id, Value::Null, false);
+            item(&writer, id, id, 0, "user_message", "message", None);
+        }
+        let mut emitted = Vec::new();
+        T3Connector::new().scan_with_callback(&context(&path,None),&mut |conversation| {
+            emitted.push(conversation.metadata["t3_thread_id"].as_str().expect("thread ID").to_owned());
+            writer.execute("UPDATE orchestration_v2_projection_threads SET deleted_at=?1 WHERE thread_id='later'",[AT])?;
+            Ok(())
+        }).expect("scan with deletion");
+        assert_eq!(emitted, vec!["first"]);
     }
 
     #[test]
